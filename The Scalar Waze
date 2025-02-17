@@ -1,0 +1,228 @@
+import numpy as np
+from scipy.integrate import odeint
+from scipy.sparse import diags
+from matplotlib import pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+from matplotlib.animation import FuncAnimation
+
+# Fundamental Constants
+λ = 2.72  # Universal scaling factor
+κ = 0.1   # Field coupling constant
+RS = 2.0  # Scaled Schwarzschild radius
+
+class UnifiedSpacetimeSimulator:
+    def __init__(self, resolution=100, Nt=1000, L=10.0):
+        # Simulation parameters
+        self.resolution = resolution
+        self.Nx = self.Ny = self.Nz = resolution
+        self.Nt = Nt
+        self.L = L * λ  # Physical size scaling
+        self.dx = self.L / self.Nx
+        self.dt = 0.01 * λ  # Temporal scaling
+        self.G = 1e-3 / λ**2  # Gravitational constant
+        
+        # Initialize spacetime fabric
+        self.fabric = self.generate_spacetime_fabric()
+        self.metric = self.compute_metric_tensor()
+        self.ricci = self.compute_ricci_tensor()
+        self.christoffel = None
+        
+        # Field containers
+        self.h_plus = np.zeros((self.Nx, self.Ny, self.Nz))
+        self.h_cross = np.zeros_like(self.h_plus)
+        self.Phi = np.random.normal(0, 1e-6*λ, (self.Nx, self.Ny, self.Nz))
+        self.A_mu = np.zeros((self.resolution, 4))
+        self.F_munu = np.zeros((self.resolution, 4, 4))
+        
+        # Quantum parameters
+        self.H = self.build_quantum_hamiltonian()
+        self.H_em = np.zeros_like(self.H)
+        
+        # Anisotropy tensors
+        self.epsilon_plus = np.array([[0.1, 0.02, 0.0], 
+                                    [0.02, 0.15, 0.0], 
+                                    [0.0, 0.0, 0.05]]) * λ**2
+        self.epsilon_cross = np.array([[0.08, 0.01, 0.0],
+                                     [0.01, 0.12, 0.0],
+                                     [0.0, 0.0, 0.03]]) * λ**2
+
+    def generate_spacetime_fabric(self):
+        """Create λ-scaled CTC coordinates"""
+        τ = np.linspace(0, 2*np.pi, self.resolution)
+        fabric = np.zeros((self.resolution, 4))
+        
+        R, r = 1.5*λ, 0.5*λ  # Scaled radii
+        ω = 3  # Winding number
+        
+        fabric[:,0] = (R + r*np.cos(ω*τ)) * np.cos(τ)
+        fabric[:,1] = (R + r*np.cos(ω*τ)) * np.sin(τ)
+        fabric[:,2] = r * np.sin(ω*τ)
+        fabric[:,3] = τ * λ / (2*np.pi)
+        return fabric
+
+    def compute_metric_tensor(self):
+        """Calculate λ-scaled metric tensor"""
+        metric = np.zeros((self.resolution, 4, 4))
+        r = np.linalg.norm(self.fabric[:,:3], axis=1)
+        φ_N = ((λ-1)/κ) * (1 - np.exp(-(r**2)/λ**2))
+        
+        for i in range(self.resolution):
+            g = np.diag([
+                -λ**2*(1 - RS/r[i] + κ*φ_N[i]/r[i]**2),
+                λ**2/(1 - RS/r[i] + κ*φ_N[i]/r[i]**2),
+                (λ*r[i])**2*(1 + κ*φ_N[i]),
+                (λ*r[i]*np.sin(self.fabric[i,2]))**2*(1 + κ*φ_N[i])
+            ])
+            g[0,2] = g[2,0] = 0.27*λ*np.exp(r[i]/λ)
+            metric[i] = g
+        return metric
+
+    def compute_ricci_tensor(self, h=1e-3):
+        """Numerical curvature calculation"""
+        christoffel = np.zeros((self.resolution, 4, 4, 4))
+        ricci = np.zeros((self.resolution, 4, 4))
+        
+        for i in range(1, self.resolution-1):
+            for μ in range(4):
+                for ν in range(4):
+                    for σ in range(4):
+                        ∂ν_gσμ = (self.metric[i+1,σ,μ] - self.metric[i-1,σ,μ])/(2*h)
+                        ∂μ_gσν = (self.metric[i+1,σ,ν] - self.metric[i-1,σ,ν])/(2*h)
+                        ∂σ_gμν = (self.metric[i+1,μ,ν] - self.metric[i-1,μ,ν])/(2*h)
+                        christoffel[i,μ,ν,σ] = 0.5*(∂ν_gσμ + ∂μ_gσν - ∂σ_gμν)
+            
+            ricci[i] = np.einsum('lik,kjl->ij', christoffel, christoffel) \
+                      - np.einsum('lkj,kil->ij', christoffel, christoffel)
+        
+        self.christoffel = christoffel
+        return ricci
+
+    def build_quantum_hamiltonian(self):
+        """Quantum dynamics operator with curvature coupling"""
+        H = np.zeros((self.resolution, self.resolution), dtype=complex)
+        r = np.linalg.norm(self.fabric[:,:3], axis=1)
+        
+        for i in range(self.resolution):
+            j = (i + 1) % self.resolution
+            dx = (self.fabric[j,:3] - self.fabric[i,:3])/λ
+            dt = (self.fabric[j,3] - self.fabric[i,3])*λ
+            ds2 = (dt**2 - np.dot(dx, dx)) * λ**2
+            phase = np.sqrt(abs(ds2)) * np.sign(ds2)
+            H[i,j] = H[j,i] = np.exp(-1j*phase)
+            
+        np.fill_diagonal(H, -1j*λ*r)
+        return H
+
+    def compute_em_fields(self, charge=1.0):
+        """Electromagnetic field initialization"""
+        r = np.linalg.norm(self.fabric[:,:3], axis=1)
+        self.A_mu[:,0] = charge*λ**2/(4*np.pi*(r + 1e-8))
+        self.A_mu[:,3] = 2.0*λ*r*np.sin(self.fabric[:,2])
+        
+        F = np.zeros((self.resolution, 4, 4))
+        dx = 2*np.pi*λ/self.resolution
+        for i in range(self.resolution):
+            for μ,ν in [(0,1), (0,2), (0,3), (1,2), (1,3), (2,3)]:
+                i_prev, i_next = (i-1)%self.resolution, (i+1)%self.resolution
+                F[i,μ,ν] = (self.A_mu[i_next,ν]-self.A_mu[i_prev,ν])/(2*dx) \
+                          - (self.A_mu[i_next,μ]-self.A_mu[i_prev,μ])/(2*dx)
+        
+        self.F_munu = np.einsum('ijk,ikl->ijl', self.metric, F)
+        return F
+
+    def anisotropic_laplacian(self, F, epsilon):
+        """λ-scaled anisotropic differential operator"""
+        F_xx = (np.roll(F,-1,0) + np.roll(F,1,0) - 2*F)/self.dx**2
+        F_yy = (np.roll(F,-1,1) + np.roll(F,1,1) - 2*F)/self.dx**2
+        F_zz = (np.roll(F,-1,2) + np.roll(F,1,2) - 2*F)/self.dx**2
+        return (epsilon[0,0]*F_xx + epsilon[1,1]*F_yy + epsilon[2,2]*F_zz
+                + 2*epsilon[0,1]*(F_xx + F_yy))
+
+    def evolve_system(self):
+        """Unified time evolution of all fields"""
+        for t in range(self.Nt):
+            # Evolve gravitational waves
+            S_plus = -16*np.pi*self.G*self.anisotropic_laplacian(self.Phi, self.epsilon_plus)
+            S_cross = -16*np.pi*self.G*self.anisotropic_laplacian(self.Phi, self.epsilon_cross)
+            
+            h_plus_new = 2*self.h_plus - self.h_plus + (self.dt**2/λ**2)*(
+                self.anisotropic_laplacian(self.h_plus, self.epsilon_plus) + S_plus)
+            h_cross_new = 2*self.h_cross - self.h_cross + (self.dt**2/λ**2)*(
+                self.anisotropic_laplacian(self.h_cross, self.epsilon_cross) + S_cross)
+            
+            # Evolve scalar field
+            Phi_new = 2*self.Phi - self.Phi + (self.dt**2/λ**2)*(
+                self.anisotropic_laplacian(self.Phi, self.epsilon_plus) 
+                - self.G*self.h_plus*self.anisotropic_laplacian(self.Phi, self.epsilon_plus))
+            
+            # Update fields with boundary conditions
+            self.h_plus = self.apply_boundary(h_plus_new)
+            self.h_cross = self.apply_boundary(h_cross_new)
+            self.Phi = self.apply_boundary(Phi_new)
+            
+            # Update spacetime curvature
+            self.update_curvature()
+            
+            # Update quantum Hamiltonian
+            self.H = self.build_quantum_hamiltonian()
+
+    def apply_boundary(self, field):
+        """Absorbing boundary conditions"""
+        field[0,:,:] *= 0.98;  field[-1,:,:] *= 0.98
+        field[:,0,:] *= 0.98;  field[:,-1,:] *= 0.98
+        field[:,:,0] *= 0.98;  field[:,:,-1] *= 0.98
+        return field
+
+    def update_curvature(self):
+        """Couple fields to spacetime metric"""
+        for i in range(self.resolution):
+            x, y, z = self.fabric[i,:3]
+            ix = int((x/self.L + 0.5)*self.Nx)
+            iy = int((y/self.L + 0.5)*self.Ny)
+            iz = int((z/self.L + 0.5)*self.Nz)
+            
+            self.metric[i,0,0] += λ**2 * self.h_plus[ix,iy,iz]
+            self.metric[i,1,1] += λ**2 * self.h_cross[ix,iy,iz]
+            
+        self.ricci = self.compute_ricci_tensor()
+
+    def visualize(self):
+        """Interactive 3D visualization"""
+        fig = plt.figure(figsize=(18,6))
+        
+        # Spacetime fabric
+        ax1 = fig.add_subplot(131, projection='3d')
+        x, y, z = self.fabric[:,:3].T
+        sc1 = ax1.scatter(x, y, z, c=self.fabric[:,3], cmap='plasma')
+        ax1.set_title('λ-Scaled Spacetime Fabric')
+        
+        # Gravitational waves
+        ax2 = fig.add_subplot(132, projection='3d')
+        X, Y, Z = np.mgrid[:self.Nx, :self.Ny, :self.Nz]
+        sc2 = ax2.scatter(X, Y, Z, c=self.h_plus.ravel(), cmap='viridis', alpha=0.6)
+        ax2.set_title('h_+ Polarization Modes')
+        
+        # Quantum state
+        ax3 = fig.add_subplot(133)
+        ψ = np.abs(expm(-1j*self.H*10/λ) @ np.ones(self.resolution))
+        ax3.plot(np.linspace(0, 2*np.pi, self.resolution), ψ)
+        ax3.set_title('Quantum State Evolution')
+        
+        plt.tight_layout()
+        plt.show()
+
+# Simulation Execution
+if __name__ == "__main__":
+    sim = UnifiedSpacetimeSimulator(resolution=100, Nt=1000, L=10.0)
+    
+    # Initial conditions
+    sim.h_plus[50,50,50] = 1e-4 * λ
+    sim.compute_em_fields(charge=1.602e-19)
+    
+    # Run simulation
+    print("Starting unified spacetime evolution...")
+    sim.evolve_system()
+    print("Simulation completed!")
+    
+    # Visualize results
+    sim.visualize()
