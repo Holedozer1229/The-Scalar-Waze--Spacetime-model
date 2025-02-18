@@ -1,0 +1,159 @@
+
+import numpy as np
+from scipy.linalg import expm
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+from matplotlib.animation import FuncAnimation
+
+# Constants
+λ = 2.72  # Fundamental eigenvalue
+κ = 0.1   # Field coupling constant
+RS = 2.0  # Schwarzschild radius analog
+
+class SpacetimeSimulator:
+    def __init__(self, resolution=100):
+        self.resolution = resolution
+        self.fabric = self.generate_spacetime_fabric()
+        self.metric = self.compute_metric_tensor()
+        self.ricci = self.compute_ricci_tensor()
+        self.H = self.build_quantum_hamiltonian()
+        
+    def generate_spacetime_fabric(self):
+        """Create λ-scaled CTC coordinates"""
+        τ = np.linspace(0, 2*np.pi, self.resolution)
+        fabric = np.zeros((self.resolution, 4))
+        
+        # Scaled toroidal coordinates
+        R = 1.5 * λ  # Major radius
+        r = 0.5 * λ   # Minor radius
+        ω = 3         # Winding number
+        
+        fabric[:,0] = (R + r*np.cos(ω*τ)) * np.cos(τ)  # X
+        fabric[:,1] = (R + r*np.cos(ω*τ)) * np.sin(τ)  # Y
+        fabric[:,2] = r * np.sin(ω*τ)                  # Z
+        fabric[:,3] = τ * λ / (2*np.pi)                # Temporal coordinate
+        
+        return fabric
+
+    def nugget_field(self, r):
+        """Scalar field solution"""
+        return ((λ-1)/κ) * (1 - np.exp(-(r**2)/λ**2))
+
+    def compute_metric_tensor(self):
+        """Calculate metric tensor g_μν at each point"""
+        metric = np.zeros((self.resolution, 4, 4))
+        r_coords = np.linalg.norm(self.fabric[:,:3], axis=1)
+        
+        for i in range(self.resolution):
+            r = r_coords[i]
+            φ_N = self.nugget_field(r)
+            
+            # Metric components (diagonal + off-diagonal)
+            g = np.diag([
+                -λ**2 * (1 - RS/r + κ*φ_N/r**2),
+                λ**2 / (1 - RS/r + κ*φ_N/r**2),
+                (λ*r)**2 * (1 + κ*φ_N),
+                (λ*r*np.sin(self.fabric[i,2]))**2 * (1 + κ*φ_N)
+            ])
+            
+            # Frame-dragging component
+            g[0,2] = g[2,0] = 0.27 * λ * np.exp(r/λ)
+            
+            metric[i] = g
+            
+        return metric
+
+    def compute_ricci_tensor(self, h=1e-3):
+        """Numerical Ricci tensor calculation"""
+        christoffel = np.zeros((self.resolution, 4, 4, 4))
+        ricci = np.zeros((self.resolution, 4, 4))
+        
+        # Finite difference calculation of Christoffel symbols
+        for i in range(1, self.resolution-1):
+            for μ in range(4):
+                for ν in range(4):
+                    for σ in range(4):
+                        # First kind Γ_{μνσ} = ½(∂_ν g_σμ + ∂_μ g_σν - ∂_σ g_μν)
+                        ∂ν_gσμ = (self.metric[i+1,σ,μ] - self.metric[i-1,σ,μ]) / (2*h)
+                        ∂μ_gσν = (self.metric[i+1,σ,ν] - self.metric[i-1,σ,ν]) / (2*h)
+                        ∂σ_gμν = (self.metric[i+1,μ,ν] - self.metric[i-1,μ,ν]) / (2*h)
+                        
+                        christoffel[i,μ,ν,σ] = 0.5 * (∂ν_gσμ + ∂μ_gσν - ∂σ_gμν)
+                        
+            # Ricci tensor R_μν = ∂_λΓ^λ_μν - ∂_νΓ^λ_μλ + Γ^λ_λσΓ^σ_μν - Γ^λ_νσΓ^σ_μλ
+            # (Implementation simplified for numerical stability)
+            ricci[i] = np.einsum('lik,kjl->ij', christoffel, christoffel) \
+                     - np.einsum('lkj,kil->ij', christoffel, christoffel)
+            
+        return ricci
+
+    def build_quantum_hamiltonian(self):
+        """Construct quantum dynamics operator"""
+        H = np.zeros((self.resolution, self.resolution), dtype=complex)
+        r = np.linalg.norm(self.fabric[:,:3], axis=1)
+        
+        for i in range(self.resolution):
+            j = (i + 1) % self.resolution
+            dx = (self.fabric[j,:3] - self.fabric[i,:3]) / λ
+            dt = (self.fabric[j,3] - self.fabric[i,3]) * λ
+            
+            # Spacetime interval with λ scaling
+            ds2 = (dt**2 - np.dot(dx, dx)) * λ**2
+            phase = np.sqrt(np.abs(ds2)) * np.sign(ds2)
+            H[i,j] = H[j,i] = np.exp(-1j * phase)
+            
+        # Curvature potential
+        np.fill_diagonal(H, -1j * λ * r)
+        
+        return H
+
+    def visualize_spacetime(self):
+        """3D plot of CTC geometry"""
+        fig = plt.figure(figsize=(10, 7))
+        ax = fig.add_subplot(111, projection='3d')
+        
+        x, y, z = self.fabric[:,0], self.fabric[:,1], self.fabric[:,2]
+        t = self.fabric[:,3]
+        
+        sc = ax.scatter(x, y, z, c=t, cmap='plasma', s=50)
+        ax.plot(x, y, z, color='gray', alpha=0.3)
+        fig.colorbar(sc, ax=ax, label='Temporal Coordinate')
+        
+        ax.set_xlabel('X (λ-scaled)')
+        ax.set_ylabel('Y (λ-scaled)')
+        ax.set_zlabel('Z (λ-scaled)')
+        plt.title(f'λ={λ} Engineered Spacetime Fabric')
+        plt.show()
+
+    def animate_quantum_state(self, frames=100):
+        """Animate quantum state evolution"""
+        ψ0 = np.exp(-(np.linspace(0, 1, self.resolution) - 0.5)**2 / 0.1**2)
+        ψ0 = ψ0.astype(complex) / np.linalg.norm(ψ0)
+        
+        fig, ax = plt.subplots()
+        x = np.linspace(0, 2*np.pi, self.resolution)
+        line, = ax.plot(x, np.abs(ψ0)**2)
+        
+        def update(frame):
+            τ = frame * 0.1
+            ψ = expm(-1j * self.H * τ / λ) @ ψ0
+            line.set_ydata(np.abs(ψ)**2)
+            return line,
+        
+        ani = FuncAnimation(fig, update, frames=frames, blit=True)
+        plt.xlabel('Temporal Coordinate')
+        plt.ylabel('Probability Density')
+        plt.title('Quantum State Evolution on CTC')
+        plt.show()
+        return ani
+
+# Run simulation
+sim = SpacetimeSimulator(resolution=100)
+sim.visualize_spacetime()
+sim.animate_quantum_state()
+
+# Print curvature diagnostics
+print("Ricci Tensor Sample:")
+print(sim.ricci[50])
+print("\nQuantum Hamiltonian Sample:")
+print(np.round(sim.H[:5,:5], 3))
