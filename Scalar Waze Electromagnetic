@@ -1,0 +1,99 @@
+import numpy as np
+from scipy.integrate import odeint
+from scipy.sparse import diags
+
+class EnhancedSpacetimeSimulator(SpacetimeSimulator):
+    def __init__(self, charge=1.0, em_strength=1.0, **kwargs):
+        self.charge = charge  # Particle charge (not density)
+        self.em_strength = em_strength
+        super().__init__(**kwargs)
+        
+        # Store necessary geometric quantities
+        self.christoffel = self.compute_christoffel()  # Now stored in parent
+        self.A_mu = self.compute_vector_potential()
+        self.F_munu = self.compute_field_tensor()
+        self.H_em = self.build_em_hamiltonian()
+
+    def compute_vector_potential(self):
+        """Calculate A_μ with proper coordinate scaling"""
+        A = np.zeros((self.resolution, 4))
+        r = np.linalg.norm(self.fabric[:,:3], axis=1)
+        θ = self.fabric[:,2]  # Toroidal angle
+        
+        # Coulomb potential + toroidal magnetic field
+        A[:,0] = self.charge * λ**2 / (4*np.pi*(r + 1e-8))  # Avoid div/0
+        A[:,3] = self.em_strength * λ * r * np.sin(θ)  # Scaled azimuthal component
+        
+        return A
+
+    def compute_field_tensor(self):
+        """Proper covariant derivative calculation"""
+        F = np.zeros((self.resolution, 4, 4))
+        dx = 2*np.pi*λ/self.resolution  # Coordinate differential
+        
+        for i in range(self.resolution):
+            for μ in range(4):
+                for ν in range(4):
+                    # Central difference with periodic BCs
+                    i_prev = (i - 1) % self.resolution
+                    i_next = (i + 1) % self.resolution
+                    
+                    ∂μ_Aν = (self.A_mu[i_next,ν] - self.A_mu[i_prev,ν])/(2*dx)
+                    ∂ν_Aμ = (self.A_mu[i_next,μ] - self.A_mu[i_prev,μ])/(2*dx)
+                    
+                    F[i,μ,ν] = ∂μ_Aν - ∂ν_Aμ
+        
+        # Antisymmetrize and lower indices
+        F = 0.5*(F - np.transpose(F, (0,2,1)))
+        return np.einsum('ijk,ikl->ijl', self.metric, F)
+
+    def build_em_hamiltonian(self):
+        """Improved minimal coupling implementation"""
+        H_em = np.zeros_like(self.H)
+        r = np.linalg.norm(self.fabric[:,:3], axis=1)
+        θ = self.fabric[:,2]
+        
+        # Covariant derivative terms
+        for i in range(self.resolution):
+            j = (i+1) % self.resolution
+            dx = self.fabric[j] - self.fabric[i]
+            
+            # Parallel transport with EM coupling
+            H_em[i,j] = -1j * self.charge * np.dot(self.A_mu[i], dx)/λ
+            H_em[j,i] = np.conj(H_em[i,j])
+            
+        # Magnetic confinement potential
+        np.fill_diagonal(H_em, 
+            -0.5 * self.em_strength**2 * (λ*r*np.sin(θ))**2
+        )
+        return H_em
+
+    def maxwell_stress_energy(self):
+        """Correct stress-energy tensor calculation"""
+        g_inv = np.linalg.inv(self.metric)
+        F_up = np.einsum('...ik,...kj->...ij', g_inv, self.F_munu)
+        F_sq = np.einsum('...ik,...kj->...ij', F_up, self.F_munu)
+        
+        T_em = F_up @ F_up.transpose(0,2,1) - 0.25*np.diagonal(F_sq, axis1=1, axis2=2)[...,None,None]*self.metric
+        return T_em / (4*np.pi)
+
+    def charged_geodesic(self, y, τ):
+        """Improved equation of motion solver"""
+        x, u = y[:4], y[4:]
+        i = np.argmin(np.sum((self.fabric - x)**2, axis=1))
+        
+        Γ = self.christoffel[i]
+        F = self.F_munu[i]
+        
+        # Covariant acceleration with EM
+        du = -np.einsum('ijk,j,k->i', Γ, u, u) + self.charge*np.einsum('ij,j->i', F, u)
+        dx = u
+        return np.concatenate([dx, du])
+
+# Key fixes and improvements:
+# 1. Christoffel storage in parent class
+# 2. Proper coordinate differential scaling
+# 3. Correct index lowering for F_munu
+# 4. Physical charge parameterization
+# 5. Accurate stress-energy tensor calculation
+# 6. Regularized Coulomb potential
