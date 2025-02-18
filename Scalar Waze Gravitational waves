@@ -1,0 +1,110 @@
+class AnisotropicSpacetimeSimulator(EnhancedSpacetimeSimulator):
+    def __init__(self, **kwargs):
+        # Grid parameters with λ scaling
+        self.Nx, self.Ny, self.Nz = 100, 100, 100
+        self.Nt = 1000
+        self.L = 10.0 * λ  # Physical size scaled by eigenvalue
+        self.dx = self.L / self.Nx
+        self.dt = 0.01 * λ  # Time step scaling
+        self.G = 1e-3 / λ**2  # Gravitational constant adjustment
+        
+        # Initialize fields with λ scaling
+        self.h_plus = np.zeros((self.Nx, self.Ny, self.Nz))
+        self.h_cross = np.zeros_like(self.h_plus)
+        self.Phi = np.zeros_like(self.h_plus)
+        
+        # Anisotropy tensors scaled by λ
+        self.epsilon_plus = np.array([[0.1, 0.02, 0.0], 
+                                    [0.02, 0.15, 0.0], 
+                                    [0.0, 0.0, 0.05]]) * λ**2
+        self.epsilon_cross = np.array([[0.08, 0.01, 0.0],
+                                     [0.01, 0.12, 0.0],
+                                     [0.0, 0.0, 0.03]]) * λ**2
+        
+        super().__init__(**kwargs)
+        
+    def anisotropic_laplacian(self, F, epsilon):
+        """λ-scaled anisotropic Laplacian operator"""
+        # Discrete differential operators
+        F_xx = (np.roll(F,-1,0) + np.roll(F,1,0) - 2*F) / (self.dx**2)
+        F_yy = (np.roll(F,-1,1) + np.roll(F,1,1) - 2*F) / (self.dx**2)
+        F_zz = (np.roll(F,-1,2) + np.roll(F,1,2) - 2*F) / (self.dx**2)
+        
+        return (epsilon[0,0]*F_xx + epsilon[1,1]*F_yy + epsilon[2,2]*F_zz +
+                2*epsilon[0,1]*(F_xx + F_yy) + 2*epsilon[0,2]*F_zz)
+
+    def evolve_fields(self):
+        """Time evolution with eigenvalue scaling"""
+        for t in range(1, self.Nt):
+            # Compute source terms with λ scaling
+            S_plus = -16 * np.pi * self.G * self.anisotropic_laplacian(self.Phi, self.epsilon_plus)
+            S_cross = -16 * np.pi * self.G * self.anisotropic_laplacian(self.Phi, self.epsilon_cross)
+            
+            # Update gravitational wave fields
+            h_plus_new = 2*self.h_plus - self.h_plus + \
+                        (self.dt**2/λ**2) * (self.anisotropic_laplacian(self.h_plus, self.epsilon_plus) + S_plus)
+            h_cross_new = 2*self.h_cross - self.h_cross + \
+                         (self.dt**2/λ**2) * (self.anisotropic_laplacian(self.h_cross, self.epsilon_cross) + S_cross)
+            
+            # Update scalar field with gravitational coupling
+            Phi_new = 2*self.Phi - self.Phi + \
+                     (self.dt**2/λ**2) * (self.anisotropic_laplacian(self.Phi, self.epsilon_plus) - \
+                     self.G * self.h_plus * self.anisotropic_laplacian(self.Phi, self.epsilon_plus))
+            
+            # Apply boundary conditions
+            self.h_plus = self.apply_boundary(h_plus_new)
+            self.h_cross = self.apply_boundary(h_cross_new)
+            self.Phi = self.apply_boundary(Phi_new)
+            
+            # Couple to spacetime curvature
+            self.update_spacetime_curvature(t)
+
+    def apply_boundary(self, field):
+        """Absorbing boundary conditions with λ scaling"""
+        boundary = 0.98  # Absorption coefficient
+        field[0,:,:] *= boundary
+        field[-1,:,:] *= boundary
+        field[:,0,:] *= boundary
+        field[:,-1,:] *= boundary
+        field[:,:,0] *= boundary
+        field[:,:,-1] *= boundary
+        return field
+
+    def update_spacetime_curvature(self, t):
+        """Couple gravitational waves to metric tensor"""
+        for i in range(self.resolution):
+            x, y, z = self.fabric[i,:3]
+            ix = int((x/self.L + 0.5) * self.Nx)
+            iy = int((y/self.L + 0.5) * self.Ny)
+            iz = int((z/self.L + 0.5) * self.Nz)
+            
+            # Modify metric components
+            self.metric[i,0,0] += λ**2 * self.h_plus[ix,iy,iz]  # Time-time component
+            self.metric[i,1,1] += λ**2 * self.h_cross[ix,iy,iz]  # Radial component
+            
+        # Recompute geometric quantities
+        self.ricci = self.compute_ricci_tensor()
+        self.H = self.build_quantum_hamiltonian()
+
+    def visualize_waves(self):
+        """3D visualization of gravitational wave polarizations"""
+        fig = plt.figure(figsize=(18,6))
+        
+        # h_plus polarization
+        ax1 = fig.add_subplot(131, projection='3d')
+        X, Y, Z = np.mgrid[:self.Nx, :self.Ny, :self.Nz]
+        ax1.scatter(X, Y, Z, c=self.h_plus.ravel(), cmap='viridis', alpha=0.6)
+        ax1.set_title('h_+ Polarization (λ-scaled)')
+        
+        # h_cross polarization
+        ax2 = fig.add_subplot(132, projection='3d')
+        ax2.scatter(X, Y, Z, c=self.h_cross.ravel(), cmap='plasma', alpha=0.6)
+        ax2.set_title('h_× Polarization (λ-scaled)')
+        
+        # Scalar field
+        ax3 = fig.add_subplot(133, projection='3d')
+        ax3.scatter(X, Y, Z, c=self.Phi.ravel(), cmap='coolwarm', alpha=0.6)
+        ax3.set_title('Scalar Field Φ (λ-scaled)')
+        
+        plt.tight_layout()
+        plt.show()
