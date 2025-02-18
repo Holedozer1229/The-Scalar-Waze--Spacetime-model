@@ -1,0 +1,139 @@
+
+import numpy as np
+from scipy.integrate import odeint
+from scipy.sparse import diags
+
+class ExtendedSpacetimeSimulator(SpacetimeSimulator):
+    def __init__(self, charge_density=0.1, em_strength=1.0, **kwargs):
+        self.q_rho = charge_density  # λ-scaled charge density
+        self.em_strength = em_strength
+        super().__init__(**kwargs)
+        
+        self.A_mu = self.compute_vector_potential()
+        self.F_munu = self.compute_field_tensor()
+        self.H_em = self.build_em_hamiltonian()
+
+    def compute_vector_potential(self):
+        """Calculate A_μ for stationary axisymmetric EM field"""
+        A = np.zeros((self.resolution, 4))
+        r = np.linalg.norm(self.fabric[:,:3], axis=1)
+        
+        # Coulomb-like potential with λ scaling
+        A[:,0] = self.q_rho * λ**2 / (4*np.pi*r)  # A_t
+        A[:,3] = self.em_strength * r * np.sin(self.fabric[:,2])  # A_φ
+        
+        return A
+
+    def compute_field_tensor(self):
+        """Calculate F_μν = ∂_μ A_ν - ∂_ν A_μ"""
+        F = np.zeros((self.resolution, 4, 4))
+        h = 1e-4  # Finite difference step
+        
+        for i in range(self.resolution):
+            for μ in range(4):
+                for ν in range(4):
+                    # Covariant derivatives with λ scaling
+                    ∂μ_Aν = (self.A_mu[(i+1)%self.resolution,ν] - self.A_mu[i-1,ν])/(2*h*λ)
+                    ∂ν_Aμ = (self.A_mu[(i+1)%self.resolution,μ] - self.A_mu[i-1,μ])/(2*h*λ)
+                    F[i,μ,ν] = ∂μ_Aν - ∂ν_Aμ
+        
+        # Anti-symmetrize
+        F = 0.5*(F - np.transpose(F, (0,2,1)))
+        return F
+
+    def build_em_hamiltonian(self):
+        """Add electromagnetic terms to quantum Hamiltonian"""
+        H_em = np.zeros_like(self.H)
+        r = np.linalg.norm(self.fabric[:,:3], axis=1)
+        θ = self.fabric[:,2]
+        
+        # Minimal coupling: p → p - qA
+        for i in range(self.resolution):
+            j = (i+1) % self.resolution
+            # Covariant derivative terms
+            H_em[i,j] = -1j * self.q_rho * (
+                self.A_mu[i,0] * (self.fabric[j,3] - self.fabric[i,3])/λ +
+                self.A_mu[i,3] * (np.sin(θ[j]) - np.sin(θ[i]))/λ
+            )
+            
+        # Magnetic potential energy
+        np.fill_diagonal(H_em, -0.5 * self.em_strength * r**2 * np.sin(θ)**2)
+        return H_em
+
+    def full_hamiltonian(self):
+        """Combine curvature and EM terms"""
+        return self.H + self.H_em/λ  # Scale EM interaction by λ
+
+    def maxwell_stress_energy(self):
+        """Compute T_μν^EM = (F_μα F^α_ν - 1/4 g_μν F^2)/μ0"""
+        F2 = np.einsum('ijk,ijk->i', self.F_munu, self.F_munu)
+        T_em = np.zeros_like(self.metric)
+        
+        for i in range(self.resolution):
+            F_munu = self.F_munu[i]
+            g_inv = np.linalg.inv(self.metric[i])
+            T_em[i] = (np.dot(F_munu, np.dot(g_inv, F_munu.T)) - 0.25*np.trace(F_munu@F_munu)*self.metric[i]
+            
+        return T_em / (4*np.pi)  # Gaussian units
+
+    def charged_geodesic(self, y, τ):
+        """Equations of motion for charged test particle"""
+        x, u = y[:4], y[4:]  # Position and 4-velocity
+        i = np.argmin(np.linalg.norm(self.fabric - x, axis=1))
+        
+        # Christoffel symbols from parent class
+        Γ = self.christoffel[i]
+        F = self.F_munu[i]
+        
+        du = -np.einsum('ijk,j,k->i', Γ, u, u) + self.q_rho*np.einsum('ij,j->i', F, u)
+        dx = u
+        return np.concatenate((dx, du))
+
+    def visualize_em_field(self):
+        """Plot electromagnetic field lines on spacetime fabric"""
+        fig = plt.figure(figsize=(12, 8))
+        ax = fig.add_subplot(111, projection='3d')
+        
+        x, y, z = self.fabric[:,:3].T
+        E_field = self.F_munu[:,0,1:4]
+        B_field = np.array([self.F_munu[:,i,j] for i,j in [(1,2),(2,3),(3,1)]])
+        
+        # Electric field lines
+        ax.quiver(x, y, z, E_field[:,0], E_field[:,1], E_field[:,2], 
+                 color='red', label='Electric Field', length=0.1)
+        
+        # Magnetic field lines
+        ax.quiver(x, y, z, B_field[0], B_field[1], B_field[2],
+                 color='blue', label='Magnetic Field', length=0.1)
+        
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_zlabel('Z')
+        plt.legend()
+        plt.title('Electromagnetic Field Structure on λ-Spactime')
+        plt.show()
+
+# Example usage
+em_sim = ExtendedSpacetimeSimulator(
+    resolution=200,
+    charge_density=0.5,
+    em_strength=2.0
+)
+
+em_sim.visualize_spacetime()
+em_sim.visualize_em_field()
+
+# Simulate charged particle motion
+y0 = np.concatenate((
+    em_sim.fabric[50],  # Initial position
+    [0, 0, 0.1*λ, 1.0] # Initial 4-velocity
+))
+τ_span = np.linspace(0, 10, 1000)
+sol = odeint(em_sim.charged_geodesic, y0, τ_span)
+
+# Animate trajectory
+fig = plt.figure()
+ax = fig.add_subplot(111, projection='3d')
+ax.plot(sol[:,0], sol[:,1], sol[:,2], 'g-')
+ax.set_title('Charged Particle Geodesic in EM-λ Spacetime')
+plt.show()
