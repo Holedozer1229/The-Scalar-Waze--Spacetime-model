@@ -1,0 +1,171 @@
+import numpy as np
+from scipy.integrate import odeint
+from scipy.linalg import expm
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+from qutip import Qobj, spre, spost, tensor
+
+# Fundamental parameters
+λ = 2.0  # Planck-scale unit (must be >1 for non-zero exotic field)
+RS = 1.0  # Dimensionless Schwarzschild radius
+κ = 0.5   # Exotic field coupling
+ω = 3     # Toroidal winding number
+
+class QuantumLoopCTCSimulator:
+    def __init__(self, nodes=100, spins=2):
+        self.nodes = nodes
+        self.spin_dim = spins
+        self.fabric = self.generate_ctc_fabric()
+        self.metric = self.compute_quantum_metric()
+        self.spin_network = self.initialize_spin_foam()
+        self.H = self.build_dirac_hamiltonian()
+        
+    def generate_ctc_fabric(self):
+        """Generate toroidal CTC geometry with spin network embedding"""
+        θ = np.linspace(0, 2*np.pi, self.nodes)
+        fabric = np.zeros((self.nodes, 4))
+        
+        R, r = 2*λ, 0.7*λ  # Major/minor radii
+        fabric[:,0] = (R + r*np.cos(ω*θ)) * np.cos(θ)  # X
+        fabric[:,1] = (R + r*np.cos(ω*θ)) * np.sin(θ)  # Y 
+        fabric[:,2] = r * np.sin(ω*θ)                  # Z
+        fabric[:,3] = λ*θ/(2*np.pi)                    # Temporal coordinate
+        
+        return fabric
+
+    def initialize_spin_foam(self):
+        """Create SU(2) spin network with area quantization"""
+        spins = (np.random.randint(0, self.spin_dim, self.nodes)*2 + 1)/2  # Half-integer spins
+        area_spectrum = 8*np.pi*λ**2 * np.sqrt(spins*(spins+1))  # LQG area quantization
+        
+        # Holonomy storage
+        holonomies = np.zeros((self.nodes, 3, 3), dtype=complex)
+        
+        # Wilson loop initialization
+        for i in range(self.nodes):
+            j = (i+1) % self.nodes
+            dx = self.fabric[j,:3] - self.fabric[i,:3]
+            Γ = self.compute_holonomy_connection(dx)
+            holonomies[i] = expm(1j * spins[i] * Γ)
+            
+        return {'spins': spins, 'area': area_spectrum, 'holonomies': holonomies}
+
+    def compute_holonomy_connection(self, dx):
+        """Calculate Ashtekar connection components"""
+        r = np.linalg.norm(dx)
+        φ_N = self.nugget_field(r)
+        
+        # SU(2) generators (Pauli matrices)
+        σ = [np.array([[0,1],[1,0]]), 
+             np.array([[0,-1j],[1j,0]]),
+             np.array([[1,0],[0,-1]])]
+        
+        # Connection components with exotic field coupling
+        Γ = np.sum([(dx[i]/r**2 + κ*φ_N*dx[i]/λ**3) * σ[i] 
+                   for i in range(3)], axis=0)
+        return Γ
+
+    def nugget_field(self, r):
+        """Exotic scalar field generating CTC effects"""
+        return ((λ-1)/κ) * (1 - np.exp(-(r**2)/λ**2))
+
+    def build_dirac_hamiltonian(self):
+        """Construct Dirac-like Hamiltonian with LQG corrections"""
+        H = np.zeros((self.nodes, self.nodes), dtype=complex)
+        area = self.spin_network['area']
+        hol = self.spin_network['holonomies']
+        
+        for i in range(self.nodes):
+            j = (i+1) % self.nodes
+            # Parallel transport operator
+            U_ij = hol[i] @ hol[j].conj().T
+            # Curvature term
+            F = (U_ij - np.eye(2)) / (λ**2)
+            
+            # Dirac operator components
+            H[i,j] = -1j * λ * np.trace(F @ σ[0])/2  # σ matrices for spinor coupling
+            H[j,i] = H[i,j].conj()
+            
+            # Mass term with area quantization
+            H[i,i] = np.sqrt(area[i])/λ + self.nugget_field(np.linalg.norm(self.fabric[i,:3]))
+            
+        return Qobj(H)
+
+    def compute_wilson_loops(self):
+        """Calculate expectation values of Wilson loop operators"""
+        W = []
+        for i in range(self.nodes):
+            path = [self.spin_network['holonomies'][(i+k)%self.nodes] 
+                   for k in range(ω)]  # Follow CTC winding
+            W.append(np.linalg.multi_dot(path).trace())
+        return np.array(W)
+
+    def evolve_quantum_geometry(self, t_max=10, steps=100):
+        """Time evolution with quantum Ricci flow"""
+        ψ0 = Qobj(np.ones(self.nodes)/np.sqrt(self.nodes))
+        t = np.linspace(0, t_max, steps)
+        
+        # Lindblad master equation for open quantum system
+        L = [spre(self.H), spost(self.H.dag())]  # Add decoherence terms as needed
+        result = mesolve(self.H, ψ0, t, [], [])
+        
+        # Track geometry observables
+        metrics = []
+        for state in result.states:
+            self.update_metric_from_state(state)
+            metrics.append(self.metric.copy())
+        return metrics
+
+    def update_metric_from_state(self, state):
+        """Adaptive metric based on quantum state probabilities"""
+        prob = np.abs(state.full())**2
+        r = np.linalg.norm(self.fabric[:,:3], axis=1)
+        
+        for i in range(self.nodes):
+            φ_N = self.nugget_field(r[i]) * prob[i]
+            self.metric[i,0,0] = -λ**2*(1 - RS/r[i] + κ*φ_N)
+            self.metric[i,1,1] = λ**2/(1 - RS/r[i] + κ*φ_N)
+
+    def visualize_quantum_ctc(self):
+        """3D visualization of quantum spacetime structure"""
+        fig = plt.figure(figsize=(16, 8))
+        
+        ax1 = fig.add_subplot(121, projection='3d')
+        x, y, z = self.fabric[:,:3].T
+        W = np.abs(self.compute_wilson_loops())
+        sc = ax1.scatter(x, y, z, c=W, cmap='viridis', s=50)
+        fig.colorbar(sc, ax=ax1, label='Wilson Loop Expectation')
+        ax1.set_title('Quantum Holonomy Distribution on CTC')
+        
+        ax2 = fig.add_subplot(122)
+        area = self.spin_network['area']
+        ax2.plot(np.sort(area), 'r-', lw=2)
+        ax2.set_xlabel('Node Index')
+        ax2.set_ylabel(r'Quantized Area ($\ell_p^2$)')
+        ax2.set_title('LQG Area Spectrum Along CTC')
+        ax2.grid(True)
+        
+        plt.tight_layout()
+        plt.show()
+
+# Example usage
+sim = QuantumLoopCTCSimulator(nodes=200, spins=2)
+sim.visualize_quantum_ctc()
+
+# Quantum geometry evolution
+metrics = sim.evolve_quantum_geometry(t_max=5)
+
+# Animate metric evolution
+fig = plt.figure()
+ax = fig.add_subplot(111, projection='3d')
+
+def update(frame):
+    ax.clear()
+    g00 = metrics[frame][:,0,0]
+    x, y, z = sim.fabric[:,:3].T
+    ax.scatter(x, y, z, c=g00, cmap='inferno')
+    ax.set_title(f'Quantum Metric Evolution (t={frame/10:.1f})')
+    return ax,
+
+ani = FuncAnimation(fig, update, frames=len(metrics), blit=False)
+plt.show()
