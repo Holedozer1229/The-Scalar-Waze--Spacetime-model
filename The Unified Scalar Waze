@@ -1,0 +1,300 @@
+import numpy as np
+from scipy.integrate import odeint
+from scipy.linalg import expm
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+from matplotlib.animation import FuncAnimation
+from qutip import Qobj, mesolve, spre, spost
+
+# Fundamental Constants
+λ = 2.0        # Planck-scale units (λ > 1)
+κ = 0.1        # Scalar field coupling
+Q = 0.5        # Fundamental charge unit
+RS = 1.0       # Normalized Schwarzschild radius
+ω = 3          # CTC winding number
+c = 1.0        # Speed of light (natural units)
+
+class CompleteUnifiedSimulation:
+    def __init__(self, resolution=100):
+        self.resolution = resolution
+        self.spacetime_grid = self.generate_ctc_geometry()
+        self.spin_network = self.initialize_spin_foam()
+        self.metric, self.inverse_metric = self.compute_quantum_metric()
+        self.em_potential = self.compute_vector_potential()
+        self.em_tensor = self.compute_em_tensor()
+        self.connection = self.compute_affine_connection()
+        self.H = self.build_unified_hamiltonian()
+        self.quantum_state = self.initialize_quantum_state()
+        self.stress_energy = self.compute_stress_energy()
+
+    def generate_ctc_geometry(self):
+        """Generate helical CTC spacetime fabric with proper time coordinate"""
+        θ = np.linspace(0, 4*np.pi, self.resolution)
+        grid = np.zeros((self.resolution, 4))
+        
+        # Toroidal coordinates with temporal helix
+        R, r = 3*λ, λ
+        grid[:,0] = (R + r*np.cos(ω*θ)) * np.cos(θ)    # X
+        grid[:,1] = (R + r*np.cos(ω*θ)) * np.sin(θ)    # Y
+        grid[:,2] = r * np.sin(ω*θ)                    # Z
+        grid[:,3] = λ*θ/(2*np.pi)                      # Temporal coordinate
+        
+        # Compute differential elements
+        self.dθ = θ[1] - θ[0]
+        self.dx = np.diff(grid, axis=0)
+        return grid
+
+    def compute_quantum_metric(self):
+        """Calculate full quantum-corrected metric tensor with inverse"""
+        metric = np.zeros((self.resolution, 4, 4))
+        inv_metric = np.zeros_like(metric)
+        r = np.linalg.norm(self.spacetime_grid[:,:3], axis=1)
+        φ_N = ((λ-1)/κ) * (1 - np.exp(-(r**2)/λ**2))
+        area_factor = np.sqrt(self.spin_network['area']/(8*np.pi*λ**2))
+
+        # Metric components from document with quantum corrections
+        for i in range(self.resolution):
+            g = np.array([
+                [-(1 + κ*φ_N[i])/area_factor[i], 0, 0, 0.27*np.exp(r[i]/λ)*area_factor[i]],
+                [0, (λ**2 * np.exp(-2*r[i]/λ) / (1 + κ*φ_N[i])) * area_factor[i], 0, 0],
+                [0, 0, r[i]**2 * (1 + κ*φ_N[i]), 0],
+                [0.27*np.exp(r[i]/λ)*area_factor[i], 0, 0, r[i]**2 * (1 + κ*φ_N[i]]
+            ])
+            metric[i] = 0.5*(g + g.T)  # Ensure symmetry
+            inv_metric[i] = np.linalg.inv(metric[i])
+            
+        return metric, inv_metric
+
+    def initialize_spin_foam(self):
+        """Create complete LQG spin network with SU(2) holonomies"""
+        spins = (np.random.randint(0, 4, self.resolution)*0.5 + 0.5)
+        areas = 8*np.pi*λ**2*np.sqrt(spins*(spins + 1))
+        
+        # SU(2) generators
+        σx = np.array([[0, 1], [1, 0]])
+        σy = np.array([[0, -1j], [1j, 0]])
+        σz = np.array([[1, 0], [0, -1]])
+        
+        holonomies = []
+        for i, s in enumerate(spins):
+            dx = self.spacetime_grid[(i+1)%self.resolution] - self.spacetime_grid[i-1]
+            A = (s/2)*(σx*dx[0] + σy*dx[1] + σz*dx[2])/λ
+            holonomies.append(expm(1j*A))
+            
+        return {
+            'spins': spins,
+            'area': areas,
+            'holonomies': holonomies,
+            'sigma_matrices': [σx, σy, σz]
+        }
+
+    def compute_vector_potential(self):
+        """Calculate full EM vector potential with gauge fixing"""
+        A = np.zeros((self.resolution, 4))
+        r = np.linalg.norm(self.spacetime_grid[:,:3], axis=1)
+        θ = np.arctan2(self.spacetime_grid[:,1], self.spacetime_grid[:,0])
+        
+        # Coulomb gauge potential
+        A[:,0] = Q*λ**2/(4*np.pi*(r + 1e-6))  # Electric potential
+        # Azimuthal magnetic potential
+        A[:,3] = 0.1*Q*r*np.exp(-r/λ)*np.sin(θ)
+        return A
+
+    def compute_em_tensor(self):
+        """Calculate full antisymmetric EM field tensor with quantum corrections"""
+        F = np.zeros((self.resolution, 4, 4))
+        h = self.dθ  # Fundamental differential from grid spacing
+        
+        for i in range(self.resolution):
+            # Central differences for derivatives
+            j = (i + 1) % self.resolution
+            k = (i - 1) % self.resolution
+            
+            for μ in range(4):
+                for ν in range(4):
+                    F[i,μ,ν] = (self.em_potential[j,ν] - self.em_potential[k,ν])/(2*h) \
+                              - (self.em_potential[j,μ] - self.em_potential[k,μ])/(2*h)
+        
+            # Apply spin network modulation
+            F[i] *= np.sqrt(self.spin_network['area'][i]/(8*np.pi*λ**2))
+            # Antisymmetrize
+            F[i] = 0.5*(F[i] - F[i].T)
+            
+        return F
+
+    def compute_affine_connection(self):
+        """Calculate complete Christoffel symbols with spin network corrections"""
+        Γ = np.zeros((self.resolution, 4, 4, 4))
+        
+        for i in range(self.resolution):
+            g = self.metric[i]
+            g_inv = self.inverse_metric[i]
+            dg = np.zeros((4, 4, 4))
+            
+            # Compute metric derivatives using central differences
+            for μ in range(4):
+                for ν in range(4):
+                    dg[μ,ν] = (self.metric[(i+1)%self.resolution,μ,ν] -
+                              self.metric[(i-1)%self.resolution,μ,ν])/(2*self.dθ)
+            
+            # Calculate Christoffel symbols
+            for μ in range(4):
+                for ν in range(4):
+                    for σ in range(4):
+                        Γ[i,μ,ν,σ] = 0.5*np.sum(
+                            g_inv[σ,α]*(dg[α,μ,ν] + dg[α,ν,μ] - dg[μ,ν,α])
+                            for α in range(4)
+                        )
+            
+            # Add spin network correction
+            Γ[i] += self.spin_network['holonomies'][i].imag / λ
+        return Γ
+
+    def build_unified_hamiltonian(self):
+        """Construct complete interaction Hamiltonian"""
+        H_gravity = np.zeros((self.resolution, self.resolution), dtype=complex)
+        H_em = np.zeros_like(H_gravity)
+        
+        # Gravity part (spin network contribution)
+        for i in range(self.resolution):
+            for j in range(self.resolution):
+                dx = self.spacetime_grid[j,:3] - self.spacetime_grid[i,:3]
+                dt = self.spacetime_grid[j,3] - self.spacetime_grid[i,3]
+                ds2 = np.dot(dx, dx) - (c*dt)**2
+                H_gravity[i,j] = -1j*np.sqrt(self.spin_network['area'][i])* \
+                               np.exp(-1j*np.sqrt(abs(ds2))/λ)
+        
+        # Electromagnetic part
+        for i in range(self.resolution):
+            for j in range(self.resolution):
+                dx = self.spacetime_grid[j] - self.spacetime_grid[i]
+                H_em[i,j] = -1j*Q*np.einsum('μ,μν,ν', dx, self.em_tensor[i], dx)/λ
+                
+        # Combine and symmetrize
+        H_total = Qobj(H_gravity + H_em)
+        return H_total + H_total.dag()
+
+    def initialize_quantum_state(self):
+        """Prepare normalized quantum state on spin network"""
+        state = np.random.randn(self.resolution) + 1j*np.random.randn(self.resolution)
+        return Qobj(state).unit()
+
+    def compute_stress_energy(self):
+        """Calculate full stress-energy tensor with quantum corrections"""
+        T = np.zeros((self.resolution, 4, 4))
+        
+        for i in range(self.resolution):
+            # Matter contribution
+            T[i,0,0] = self.quantum_state.full()[i].real**2  # Energy density
+            T[i,1:,1:] = np.eye(3)*T[i,0,0]/3  # Isotropic pressure
+            
+            # Electromagnetic contribution
+            F = self.em_tensor[i]
+            T[i] += (np.einsum('μα,να->μν', F, F) - 0.25*np.eye(4)*np.trace(F@F))/(4*np.pi)
+            
+            # Quantum correction factor
+            T[i] *= np.sqrt(self.spin_network['area'][i]/(8*np.pi*λ**2))
+            
+        return T
+
+    def geodesic_equation(self, y, τ):
+        """Complete charged geodesic equation with torsion"""
+        x, u = y[:4], y[4:]  # Position and 4-velocity
+        i = np.argmin(np.linalg.norm(self.spacetime_grid - x, axis=1))
+        
+        # General relativistic acceleration
+        du_gr = -np.einsum('ijk,j,k->i', self.connection[i], u, u)
+        
+        # Electromagnetic acceleration
+        du_em = Q*np.einsum('ij,j->i', self.em_tensor[i], u)
+        
+        # Torsion contribution from spin network
+        du_torsion = 0.1*np.cross(u[1:], self.spin_network['sigma_matrices'][i%3][1:,1:])
+        
+        return np.concatenate((u, (du_gr + du_em + du_torsion)))
+
+    def evolve_system(self, t_max=10, steps=100):
+        """Full quantum-classical co-evolution"""
+        # Quantum state evolution
+        t = np.linspace(0, t_max, steps)
+        result = mesolve(self.H, self.quantum_state, t, [], [])
+        
+        # Simultaneous classical evolution
+        geodesics = []
+        for state in result.states:
+            # Update metric with quantum back-reaction
+            prob = np.abs(state.full())**2
+            self.metric[:,0,0] *= (1 + 0.1*prob[:,0])
+            
+            # Evolve test particle
+            y0 = np.concatenate((self.spacetime_grid[0], [0,0,0.1*c, c]))
+            sol = odeint(self.geodesic_equation, y0, t)
+            geodesics.append(sol[-1])
+            
+        return result, geodesics
+
+    def visualize(self):
+        """Complete 3D visualization system"""
+        fig = plt.figure(figsize=(20, 10))
+        ax = fig.add_subplot(111, projection='3d')
+        
+        # Spacetime fabric
+        x, y, z = self.spacetime_grid[:,:3].T
+        t = self.spacetime_grid[:,3]
+        sc = ax.scatter(x, y, z, c=t, cmap='viridis', s=50)
+        
+        # EM field lines
+        Ex, Ey, Ez = self.em_tensor[:,0,1:4].T
+        ax.quiver(x, y, z, Ex, Ey, Ez, color='red', length=0.3)
+        
+        # Spin network nodes
+        ax.scatter(x, y, z, s=self.spin_network['area'], c='white', alpha=0.3)
+        
+        # Geodesic trajectory
+        result, geodesics = self.evolve_system()
+        path = np.array(geodesics)
+        ax.plot(path[:,0], path[:,1], path[:,2], 'y-', lw=2)
+        
+        # Quantum state projection
+        prob = np.abs(result.states[-1].full())**2
+        ax.plot(x, y, z, 'w--', alpha=0.1)
+        ax.scatter(x, y, z, s=500*prob, c=prob, cmap='plasma', alpha=0.7)
+        
+        ax.set_title('Complete Unified Quantum Spacetime Simulation\n' +
+                    f'λ={λ}, κ={κ}, Q={Q}, ω={ω}')
+        ax.set_xlabel('X (λ units)')
+        ax.set_ylabel('Y (λ units)')
+        ax.set_zlabel('Z (λ units)')
+        plt.show()
+
+    def animate_evolution(self):
+        """Real-time animation of quantum-classical dynamics"""
+        fig = plt.figure(figsize=(16, 8))
+        ax = fig.add_subplot(111, projection='3d')
+        
+        result, geodesics = self.evolve_system()
+        path = np.array(geodesics)
+        
+        def update(frame):
+            ax.clear()
+            # Spacetime structure
+            x, y, z = self.spacetime_grid[:,:3].T
+            ax.scatter(x, y, z, c=self.spacetime_grid[:,3], cmap='viridis', s=50)
+            
+            # Current quantum state
+            prob = np.abs(result.states[frame].full())**2
+            ax.scatter(x, y, z, s=500*prob, c=prob, cmap='plasma', alpha=0.7)
+            
+            # Particle trajectory
+            ax.plot(path[:frame,0], path[:frame,1], path[:frame,2], 'y-', lw=2)
+            
+            ax.set_title(f'Quantum Spacetime Evolution (t={frame/10:.1f}λ/c)')
+            return ax,
+        
+        ani = FuncAnimation(fig, update, frames=len(result.states), blit=False)
+        plt.show()
+
+# Run complete simulation
+sim = CompleteUnifiedSimulation(resolution=200)
+sim.visualize()
+sim.animate_evolution()
