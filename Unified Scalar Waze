@@ -1,0 +1,175 @@
+import numpy as np
+from scipy.linalg import expm
+from scipy.integrate import ode
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+from matplotlib.animation import FuncAnimation
+from scipy.constants import c, ε₀, μ₀, e, m_e
+
+# Fundamental Constants
+λ = 2.718281828459045  # Euler-derived eigenvalue
+κ = 0.161803398874989  # Golden ratio coupling
+R_s = 2.897771955*λ    # Scaled Schwarzschild radius
+f_schumann = 7.83      # Primary Schumann resonance
+
+class UnifiedSpacetime:
+    def __init__(self, resolution=256, charge_density=1e-12):
+        # Core spacetime structure
+        self.res = resolution
+        self.fabric = self.generate_spacetime_fabric()
+        self.metric = self.compute_metric()
+        self.ricci = self.compute_ricci()
+        
+        # Field components
+        self.quantum = self.init_quantum_fields()
+        self.em = self.init_em_fields()
+        self.gw = self.init_gravitational_waves()
+        
+        # Dynamic systems
+        self.particles = []
+        self.stress_energy = np.zeros((self.res, 4, 4))
+        
+        # Unified parameters
+        self.α = 1/(4*np.pi*ε₀)  # EM coupling
+        self.β = 8*np.pi*G/c**4  # Gravitational coupling
+
+    def generate_spacetime_fabric(self):
+        """Toroidal CTC geometry with harmonic scaling"""
+        τ = np.linspace(-np.pi, np.pi, self.res)
+        fabric = np.zeros((self.res, 4))
+        
+        # λ-scaled coordinates
+        R = 1.618*λ  # Golden ratio major radius
+        r = 0.5*λ     # Minor radius
+        fabric[:,0] = (R + r*np.cos(3*τ)) * np.cos(τ)
+        fabric[:,1] = (R + r*np.cos(3*τ)) * np.sin(τ)
+        fabric[:,2] = r * np.sin(3*τ)
+        fabric[:,3] = λ * τ / (2*np.pi)
+        
+        return fabric
+
+    def compute_metric(self):
+        """λ-scaled Reissner-Nordström-like metric with quantum corrections"""
+        metric = np.zeros((self.res, 4, 4))
+        r = np.linalg.norm(self.fabric[:,:3], axis=1)
+        
+        Φ = self.quantum['scalar'] + self.gw['plus']
+        Q = self.em['charge']*λ**2/(4*np.pi*ε₀)
+        
+        for i in range(self.res):
+            g_tt = -(1 - R_s/r[i] + Q**2/r[i]**2 - Λ*r[i]**2/3) * λ**2
+            g_rr = 1/(1 - R_s/r[i] + Q**2/r[i]**2 - Λ*r[i]**2/3) * λ**2
+            g_θθ = (λ*r[i])**2 * (1 + κ*Φ[i])
+            g_φφ = g_θθ * np.sin(self.fabric[i,2])**2
+            
+            metric[i] = np.diag([g_tt, g_rr, g_θθ, g_φφ])
+            metric[i,0,2] = metric[i,2,0] = 0.27*λ*np.exp(-r[i]/λ)
+            
+        return metric
+
+    def init_quantum_fields(self):
+        """Dirac-Maxwell coupled fields"""
+        return {
+            'scalar': np.random.normal(0, 1e-3, self.res),
+            'spinor': np.zeros((self.res, 4), dtype=complex),
+            'potential': np.zeros((self.res, 4))
+        }
+
+    def init_em_fields(self):
+        """Retarded potential solutions"""
+        return {
+            'vector_potential': np.zeros((self.res, 4)),
+            'field_tensor': np.zeros((self.res, 4, 4)),
+            'charge': 1.602e-19 * λ
+        }
+
+    def init_gravitational_waves(self):
+        """TT-gauge wave solutions"""
+        t = self.fabric[:,3]
+        return {
+            'plus': 1e-6 * np.sin(2*np.pi*f_schumann*t),
+            'cross': 1e-6 * np.cos(2*np.pi*f_schumann*t)
+        }
+
+    def build_hamiltonian(self):
+        """Quantum-gravity coupled operator"""
+        H = np.zeros((self.res, self.res), dtype=complex)
+        r = np.linalg.norm(self.fabric[:,:3], axis=1)
+        
+        # Spacetime curvature terms
+        np.fill_diagonal(H, -1j*λ*(r + 0.5*self.ricci[:,0,0]))
+        
+        # Entanglement terms
+        for i in range(self.res-1):
+            dx = self.fabric[i+1,:3] - self.fabric[i,:3]
+            H[i,i+1] = np.exp(-1j*np.dot(dx, self.em['vector_potential'][i,:3]))
+            H[i+1,i] = H[i,i+1].conj()
+            
+        return H
+
+    def evolve_system(self, dt=1e-18, steps=1000):
+        """Unified time evolution"""
+        for _ in range(steps):
+            # 1. Evolve quantum state
+            ψ = expm(-1j*self.build_hamiltonian()*dt/λ) @ self.quantum['spinor'][:,0]
+            
+            # 2. Update EM fields from charges
+            self.solve_maxwell()
+            
+            # 3. Propagate gravitational waves
+            self.propagate_gravitational_waves(dt)
+            
+            # 4. Move charged particles
+            self.move_charged_particles(dt)
+            
+            # 5. Recompute spacetime metric
+            self.metric = self.compute_metric()
+            self.ricci = self.compute_ricci()
+
+    def visualize_universe(self):
+        """4D visualization of all components"""
+        fig = plt.figure(figsize=(20, 16))
+        
+        # Spacetime curvature
+        ax1 = fig.add_subplot(221, projection='3d')
+        x, y, z = self.fabric[:,:3].T
+        ax1.scatter(x, y, z, c=np.diag(self.ricci[:,0,0]), cmap='viridis')
+        ax1.set_title('Ricci Curvature')
+        
+        # Quantum probability
+        ax2 = fig.add_subplot(222)
+        ax2.plot(np.abs(self.quantum['spinor'][:,0])**2)
+        ax2.set_title('Quantum Probability Density')
+        
+        # Gravitational waves
+        ax3 = fig.add_subplot(223)
+        ax3.plot(self.gw['plus'], label='+ Polarization')
+        ax3.plot(self.gw['cross'], label='× Polarization')
+        ax3.set_title('Gravitational Wave Strain')
+        
+        # Charged particle paths
+        ax4 = fig.add_subplot(224, projection='3d')
+        for p in self.particles:
+            path = np.array(p['path'])
+            ax4.plot(path[:,0], path[:,1], path[:,2])
+        ax4.set_title('Charged Geodesics')
+        
+        plt.tight_layout()
+        plt.show()
+
+# Example Usage
+universe = UnifiedSpacetime(resolution=512, charge_density=1e-15)
+
+# Add charged particles
+for _ in range(5):
+    universe.add_particle(
+        position=np.random.randn(4),
+        velocity=0.1*c*np.random.randn(4),
+        charge=1.6e-19
+    )
+
+# Evolve the system
+universe.evolve_system(dt=1e-21, steps=5000)
+
+# Visualize final state
+universe.visualize_universe()
