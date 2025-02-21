@@ -1,0 +1,520 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.integrate import odeint
+from mpl_toolkits.mplot3d import Axes3D
+import warnings
+import random
+warnings.filterwarnings('ignore')
+
+class UnifiedSpacetimeSimulator:
+    def __init__(self, resolution=30, lambda_=5.29e-11, kappa=0.1, charge_density=1e-19):
+        # Adjust resolution and parameters for atomic scale
+        self.resolution = resolution  # Reduced resolution for performance
+        self.lambda_ = lambda_  # Adjust for atomic scale, e.g., Bohr radius (~5.29e-11 m)
+        self.kappa = kappa
+        self.charge_density = charge_density  # Reduced for atomic charges
+        self.beta = 0.1
+        self.g_strong = 0.0  # Disable strong force (negligible for hydrogen)
+        self.g_weak = 0.0    # Disable weak force (negligible for hydrogen)
+        self.mass_e = 9.11e-31  # Electron mass
+        self.mass_q = 1.673e-27  # Physical proton mass
+        self.c = 3e8
+        self.hbar = 1.0545718e-34
+        self.eps_0 = 8.854187817e-12
+        self.G = 6.67430e-11  # Physical gravitational constant
+
+        self.dx = 5.29e-11 / (self.resolution - 1)  # Direct atomic scale (Bohr radius)
+        self.dt = 1e-12  # Increased time step for stability and evolution
+        self.time = 0.0
+
+        self.schumann_freqs = []  # Disable Schumann resonances (not relevant for atom)
+        self.schumann_amplitudes = []
+        self.pythagorean_ratios = [1.0]  # Simplify ratios
+        self.casimir_scale = 1e-11  # Adjust Casimir scale for atomic size
+
+        # Generate a 3D spherical fabric centered around the proton
+        self.fabric, self.edges = self.generate_spacetime_fabric()
+        print(f"Fabric shape: {self.fabric.shape}, Resolution: {self.resolution}")
+        self.quantum = self.init_quantum_fields()
+        self.em = self.init_em_fields()
+        self.metric = self.compute_metric()
+        self.christoffel = self.compute_christoffel_symbols_analytical()
+        self.strong = self.init_strong_fields()  # Keep but unused
+        self.weak = self.init_weak_fields()     # Keep but unused
+        self.gw = self.init_gravitational_waves()  # Keep but minimize
+        self.stress_energy = np.zeros((resolution, 4, 4), dtype=np.float32)
+        self.particles = []
+
+        # Add proton at the origin
+        self.add_particle(position=np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32), 
+                          velocity=np.zeros(4, dtype=np.float32), 
+                          charge=1.602e-19)  # Proton charge (+e)
+
+        # Initialize electron as a quantum field and sample a classical particle from its distribution
+        self.add_electron_quantum_field()
+        self.add_electron_particle_hybrid()
+
+    def generate_spacetime_fabric(self):
+        # Create a 3D spherical grid for atomic scale, centered at origin
+        fabric = np.zeros((self.resolution, 4), dtype=np.float32)
+        n_theta = int(np.sqrt(self.resolution))  # Number of points per ring
+        n_phi = int(np.sqrt(self.resolution))    # Number of rings
+        idx = 0
+        for i in range(n_theta):
+            for j in range(n_phi):
+                theta = 2 * np.pi * i / n_theta  # Azimuthal angle
+                phi = np.pi * j / n_phi          # Polar angle
+                r = self.dx  # Radius fixed at Bohr radius for simplicity
+                x = r * np.sin(phi) * np.cos(theta)
+                y = r * np.sin(phi) * np.sin(theta)
+                z = r * np.cos(phi)
+                t = 0.0  # Start at t=0
+                fabric[idx] = np.array([x, y, z, t], dtype=np.float32)
+                idx += 1
+        
+        # Simple 3D topology for edges (connect points in a grid-like manner)
+        edge_list = []
+        for i in range(n_theta):
+            for j in range(n_phi):
+                idx = i * n_phi + j
+                # Connect to next point in theta (circumferential)
+                if j < n_phi - 1:
+                    edge_list.append((idx, idx + 1))
+                else:
+                    edge_list.append((idx, i * n_phi))  # Wrap around
+                # Connect to next point in phi (radial)
+                if i < n_theta - 1:
+                    next_theta = i + 1
+                    next_idx = next_theta * n_phi + j
+                    edge_list.append((idx, next_idx))
+        spins = np.random.choice([0.5, 1.0], len(edge_list))
+        
+        return fabric, list(zip(edge_list, spins))
+
+    def init_quantum_fields(self):
+        # Initialize electron spinor for quantum behavior (1s orbital in 3D)
+        r = np.linalg.norm(self.fabric[:, :3], axis=1)
+        phi_N = (self.lambda_ / self.kappa) * (1 - np.exp(-r**2 / (self.lambda_**2)))  # Simplified potential
+        # Initialize electron spinor with a ground-state-like distribution (1s orbital)
+        spinor = np.zeros((self.resolution, 4), dtype=np.complex64)
+        for i in range(self.resolution):
+            r_i = r[i]
+            if r_i < 1e-11: r_i = 1e-11  # Avoid singularity
+            # Approximate 1s orbital (normalized Gaussian in 3D)
+            amplitude = np.exp(-r_i**2 / (2 * (5.29e-11)**2)) / np.sqrt(np.pi * (5.29e-11)**3)
+            spinor[i, 0] = amplitude  # Positive energy, spin-up (simplified)
+        quark_spinors = np.zeros((self.resolution, 2, 12), dtype=np.complex64)  # No quarks for hydrogen
+        return {
+            'spinor': spinor,
+            'quark_spinors': quark_spinors,
+            'phi_N': phi_N.astype(np.float32)
+        }
+
+    def add_electron_quantum_field(self):
+        # Rely on quantum field for electron behavior
+        pass  # Quantum evolution will handle this via dirac_rhs and evolve_quantum_field_rk4
+
+    def add_electron_particle_hybrid(self):
+        # Sample initial position and velocity from the quantum probability distribution
+        spinor_norm = np.sum(np.abs(self.quantum['spinor'])**2, axis=1)
+        spinor_norm = np.nan_to_num(spinor_norm, nan=0.0, posinf=0.0, neginf=0.0)  # Handle NaN/Inf
+        if np.sum(spinor_norm) == 0:
+            spinor_norm = np.ones_like(spinor_norm) / self.resolution  # Fallback uniform distribution
+        else:
+            spinor_norm /= np.sum(spinor_norm)  # Normalize to get probability distribution
+        # Sample position from the fabric points based on probability
+        position_idx = np.random.choice(range(self.resolution), p=spinor_norm)
+        initial_pos = self.fabric[position_idx, :4].copy()
+        initial_pos[3] = 0.0  # Set time to 0 for simplicity
+        
+        # Sample velocity based on Bohr model (tangential for circular orbit)
+        r = np.linalg.norm(initial_pos[:3])
+        v_bohr = (1 / 137) * self.c  # Bohr velocity ≈ 2.19e6 m/s
+        theta = 2 * np.pi * random.random()  # Random angle for tangential velocity
+        phi = np.pi * random.random()  # Random polar angle for 3D
+        vx = v_bohr * np.sin(phi) * np.cos(theta)
+        vy = v_bohr * np.sin(phi) * np.sin(theta)
+        vz = v_bohr * np.cos(phi)
+        initial_vel = np.array([vx, vy, vz, 0.0], dtype=np.float32)
+        
+        self.add_particle(position=initial_pos, velocity=initial_vel, charge=-1.602e-19)  # Electron charge (-e)
+
+    def compute_metric(self):
+        metric = np.tile(np.eye(4, dtype=np.float32)[np.newaxis, :, :], (self.resolution, 1, 1))
+        r = np.linalg.norm(self.fabric[:, :3], axis=1)
+        r = np.where(r < 1e-11, 1e-11, r)
+        phi_N = self.quantum['phi_N'][:, np.newaxis, np.newaxis]
+        
+        # Minimal metric with physical gravitational effect for proton (negligible)
+        mass_term = 2 * self.G * self.mass_q / (self.c**2 * r)  # Very small
+        charge_term = (self.em['charge'] * self.lambda_ / (4 * np.pi * self.eps_0 * r**2))**2  # Coulomb effect (not in metric)
+        casimir_energy = -np.pi**2 * self.hbar * self.c / (720 * self.casimir_scale**2)  # Reduced Casimir
+        casimir_term = casimir_energy / (self.c**2)
+        
+        print(f"mass_term shape: {mass_term.shape}, resolution: {self.resolution}")
+        for i in range(self.resolution):
+            # Lorentzian signature with minimal gravitational perturbation
+            g_00 = -(1 - 2 * mass_term[i])  # Nearly -1.0 due to small mass_term
+            if g_00 >= 0 or np.abs(g_00) < 1e-10:
+                g_00 = -1.0 + 1e-10  # Ensure negative
+            metric[i, 0, 0] = g_00
+            
+            spatial_factor = 1 + 2 * mass_term[i] / (1 - 2 * mass_term[i])  # Nearly 1.0
+            if spatial_factor <= 0 or np.abs(spatial_factor) < 1e-10:
+                spatial_factor = 1.0 + 1e-10
+            metric[i, 1, 1] = spatial_factor
+            metric[i, 2, 2] = spatial_factor
+            metric[i, 3, 3] = spatial_factor
+            
+            metric[i, 0, 3] = 0.0
+            metric[i, 3, 0] = 0.0
+        
+        return metric
+
+    def compute_christoffel_symbols_analytical(self, h=1e-4):
+        christoffel = np.zeros((self.resolution, 4, 4, 4), dtype=np.float32)
+        # Compute minimal Christoffel symbols for physical Schwarzschild-like metric (negligible)
+        for i in range(self.resolution):
+            r = np.linalg.norm(self.fabric[i, :3])
+            if r < 1e-11: continue
+            mass_term = 2 * self.G * self.mass_q / (self.c**2 * r)
+            for mu in range(4):
+                for nu in range(4):
+                    for sigma in range(4):
+                        if mu == 0 and nu == 0 and sigma == 1:  # Radial component
+                            christoffel[i, mu, nu, sigma] = mass_term / r
+                        elif mu == 1 and nu == 0 and sigma == 0:  # Symmetry
+                            christoffel[i, mu, nu, sigma] = mass_term / r
+                        # Add other components for full Schwarzschild metric if needed
+        return christoffel
+
+    def init_em_fields(self):
+        # Model Coulomb potential from proton at origin
+        A_mu = np.zeros((self.resolution, 4), dtype=np.float32)
+        F_munu = np.zeros((self.resolution, 4, 4), dtype=np.float32)
+        r = np.linalg.norm(self.fabric[:, :3], axis=1)
+        r = np.where(r < 1e-11, 1e-11, r)
+        # Coulomb potential: A_0 = -q / (4 * pi * epsilon_0 * r)
+        proton_charge = 1.602e-19  # Proton charge
+        A_mu[:, 0] = -proton_charge / (4 * np.pi * self.eps_0 * r)  # Time component of vector potential
+        for i in range(self.resolution):
+            # Simplified electromagnetic tensor (F_0i = -partial_i A_0) in curved spacetime
+            for mu in range(1, 4):
+                F_munu[i, 0, mu] = -(A_mu[(i+1)%self.resolution, 0] - A_mu[(i-1)%self.resolution, 0]) / (2 * self.dx)
+                F_munu[i, mu, 0] = -F_munu[i, 0, mu]
+        return {
+            'A_mu': A_mu,
+            'F_munu': F_munu,
+            'charge': -1.602e-19  # Electron charge for quantum and particle dynamics
+        }
+
+    def init_strong_fields(self):
+        return {
+            'A_mu': np.zeros((self.resolution, 8, 4), dtype=np.float32),
+            'F_munu': np.zeros((self.resolution, 8, 4, 4), dtype=np.float32)
+        }
+
+    def init_weak_fields(self):
+        return {
+            'W_mu': np.zeros((self.resolution, 3, 4), dtype=np.float32),
+            'W_munu': np.zeros((self.resolution, 3, 4, 4), dtype=np.float32),
+            'higgs': np.ones(self.resolution, dtype=np.float32) * 246e9 / self.c
+        }
+
+    def init_gravitational_waves(self):
+        t = self.fabric[:, 3]
+        return {
+            'plus': np.zeros_like(t, dtype=np.float32),  # Disable for atomic scale
+            'cross': np.zeros_like(t, dtype=np.float32)
+        }
+
+    def compute_vierbein(self, g_mu_nu):
+        e_a_mu = np.zeros((4, 4), dtype=np.float64)
+        for mu in range(4):
+            diag_value = g_mu_nu[mu, mu]
+            # Ensure diagonal elements are non-zero and positive for sqrt in curved spacetime
+            if diag_value <= 0 or np.abs(diag_value) < 1e-10:
+                e_a_mu[mu, mu] = 1e-6 if mu == 0 else 1.0  # Adjust for Lorentzian signature
+            else:
+                e_a_mu[mu, mu] = np.sqrt(np.abs(diag_value))
+        return e_a_mu
+
+    def dirac_gamma_matrices(self, g_mu_nu):
+        gamma_flat = [
+            np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, -1, 0], [0, 0, 0, -1]], dtype=np.complex64),
+            np.array([[0, 0, 0, 1], [0, 0, 1, 0], [0, -1, 0, 0], [-1, 0, 0, 0]], dtype=np.complex64),
+            np.array([[0, 0, 0, -1j], [0, 0, 1j, 0], [0, 1j, 0, 0], [-1j, 0, 0, 0]], dtype=np.complex64),
+            np.array([[0, 0, 1, 0], [0, 0, 0, -1], [-1, 0, 0, 0], [0, 1, 0, 0]], dtype=np.complex64)
+        ]
+        e_a_mu = self.compute_vierbein(g_mu_nu)
+        e_mu_a = np.linalg.inv(e_a_mu)
+        gamma_mu = [sum(e_mu_a[mu, a] * gamma_flat[a] for a in range(4)) for mu in range(4)]
+        return gamma_mu
+
+    def gell_mann_matrices(self):
+        return [
+            np.array([[0, 1, 0], [1, 0, 0], [0, 0, 0]], dtype=np.complex64),
+            np.array([[0, -1j, 0], [1j, 0, 0], [0, 0, 0]], dtype=np.complex64),
+            np.array([[1, 0, 0], [0, -1, 0], [0, 0, 0]], dtype=np.complex64),
+            np.array([[0, 0, 1], [0, 0, 0], [1, 0, 0]], dtype=np.complex64),
+            np.array([[0, 0, -1j], [0, 0, 0], [1j, 0, 0]], dtype=np.complex64),
+            np.array([[0, 0, 0], [0, 0, 1], [0, 1, 0]], dtype=np.complex64),
+            np.array([[0, 0, 0], [0, 0, -1j], [0, 1j, 0]], dtype=np.complex64),
+            np.array([[1, 0, 0], [0, 1, 0], [0, 0, -2]], dtype=np.complex64) / np.sqrt(3)
+        ]
+
+    def covariant_derivative(self, psi, i, mu, quark=False, flavor=None, color=None):
+        if mu != 0:
+            if not quark:  # Only for electron (no quarks in hydrogen)
+                psi_plus = self.quantum['spinor'][(i + 1) % self.resolution] if i + 1 < self.resolution else psi
+                psi_minus = self.quantum['spinor'][(i - 1) % self.resolution] if i - 1 >= 0 else psi
+                partial_psi = (psi_plus - psi_minus) / (2 * self.dx)
+                harmonic_scale = self.pythagorean_ratios[mu % len(self.pythagorean_ratios)]
+                partial_psi *= harmonic_scale
+                # Use Christoffel symbols for curved spacetime
+                connection_term = np.dot(self.christoffel[i, mu], psi)
+                # Add electromagnetic coupling (minimal coupling) in curved spacetime
+                A_mu = self.em['A_mu'][i, mu]
+                partial_psi -= 1j * self.em['charge'] * A_mu * psi / self.hbar
+                return partial_psi + connection_term
+            else:
+                return np.zeros_like(psi)  # No quarks
+        else:
+            return np.zeros_like(psi)
+
+    def dirac_hamiltonian(self, psi, i, t, quark=False, flavor=None, color=None):
+        if quark:
+            return np.zeros(12, dtype=np.complex64)  # No quarks
+        # Non-relativistic Schrödinger equation in curved spacetime, with NaN/Inf check and diagnostics
+        H_psi = np.zeros(4, dtype=np.complex64)
+        r = np.linalg.norm(self.fabric[i, :3])
+        if r < 1e-11: r = 1e-11
+        # Coulomb potential: V = -k * e^2 / r, where k = 1/(4 * pi * epsilon_0)
+        V_coulomb = -1.602e-19 * 1.602e-19 / (4 * np.pi * self.eps_0 * r)
+        H_psi += V_coulomb * psi  # Potential energy
+        print(f"Point {i}, Coulomb potential: {V_coulomb}")
+        # Kinetic energy using covariant derivative for curved spacetime, with NaN/Inf check
+        for mu in range(1, 4):
+            D_mu_psi = self.covariant_derivative(psi, i, mu, quark=False)
+            D_mu_psi = np.nan_to_num(D_mu_psi, nan=0.0, posinf=0.0, neginf=0.0)  # Handle NaN/Inf
+            H_psi -= (self.hbar**2 / (2 * self.mass_e)) * D_mu_psi  # Use covariant derivative
+            print(f"Point {i}, Kinetic term mu={mu}: {D_mu_psi}")
+        H_psi = np.nan_to_num(H_psi, nan=0.0, posinf=0.0, neginf=0.0)  # Ensure no NaN/Inf in H_psi
+        print(f"Point {i}, Hamiltonian: {H_psi}")
+        return H_psi
+
+    def dirac_rhs(self, psi, t, i, quark=False, flavor=None, color=None):
+        # Ensure no NaN/Inf in the rhs
+        H_psi = self.dirac_hamiltonian(psi, i, t, quark=False)
+        rhs = -1j * H_psi / self.hbar
+        return np.nan_to_num(rhs, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def evolve_quantum_field_rk4(self):
+        dt = self.dt
+        for i in range(self.resolution):
+            t = self.time
+            psi = self.quantum['spinor'][i]
+            # Check for NaN/Inf in psi
+            if np.any(np.isnan(psi)) or np.any(np.isinf(psi)):
+                print(f"Warning: NaN or Inf detected in spinor at index {i}, resetting to zero")
+                psi = np.zeros_like(psi, dtype=np.complex64)
+            k1 = self.dirac_rhs(psi, t, i, quark=False)
+            k2 = self.dirac_rhs(psi + 0.5 * dt * k1, t + 0.5 * dt, i, quark=False)
+            k3 = self.dirac_rhs(psi + 0.5 * dt * k2, t + 0.5 * dt, i, quark=False)
+            k4 = self.dirac_rhs(psi + dt * k3, t + dt, i, quark=False)
+            # Update psi, ensuring no NaN/Inf and normalizing
+            new_psi = psi + (k1 + 2 * k2 + 2 * k3 + k4) * (dt / 6)
+            new_psi = np.nan_to_num(new_psi, nan=0.0, posinf=0.0, neginf=0.0)  # Handle NaN/Inf
+            # Normalize psi
+            norm = np.sqrt(np.sum(np.abs(new_psi)**2))
+            if norm > 0:
+                new_psi /= norm
+            self.quantum['spinor'][i] = new_psi
+        self.time += dt
+
+    def evolve_system(self, steps=1000):
+        # Evolve quantum fields and update classical particle positions based on quantum probability
+        for _ in range(steps):
+            self.evolve_quantum_field_rk4()
+            
+            # Update electromagnetic fields (Coulomb potential is static, but we can evolve A_mu slightly)
+            for i in range(self.resolution):
+                for μ in range(4):
+                    for ν in range(4):
+                        self.em['F_munu'][i, μ, ν] = (self.em['A_mu'][(i+1)%self.resolution, ν] - 
+                                                      self.em['A_mu'][(i-1)%self.resolution, ν] - 
+                                                      self.em['A_mu'][(i+1)%self.resolution, μ] + 
+                                                      self.em['A_mu'][(i-1)%self.resolution, μ]) / (2 * self.dx)
+            # Minimal evolution of A_mu (static for Coulomb potential)
+            self.em['A_mu'] += np.random.normal(0, 1e-20, (self.resolution, 4))  # Very small noise
+            
+            self.move_charged_particles_hybrid(self.dt)
+            self.metric = self.compute_metric()  # Recompute metric (curved spacetime)
+            self.christoffel = self.compute_christoffel_symbols_analytical()  # Update Christoffel symbols
+            self.total_stress_energy()
+
+    def move_charged_particles_hybrid(self, dt):
+        spinor = self.quantum['spinor']
+        spinor_norm = np.sum(np.abs(spinor)**2, axis=1)
+        spinor_norm = np.nan_to_num(spinor_norm, nan=0.0, posinf=0.0, neginf=0.0)
+        if np.sum(spinor_norm) == 0:
+            spinor_norm = np.ones_like(spinor_norm) / self.resolution  # Fallback uniform distribution
+        else:
+            spinor_norm /= np.sum(spinor_norm)  # Normalize
+
+        # Compute expectation values for position and momentum
+        x_exp = np.sum(spinor_norm * self.fabric[:, 0])
+        y_exp = np.sum(spinor_norm * self.fabric[:, 1])
+        z_exp = np.sum(spinor_norm * self.fabric[:, 2])
+        # Approximate momentum expectation (simplified, based on Bohr model)
+        r_exp = np.sqrt(x_exp**2 + y_exp**2 + z_exp**2)
+        v_bohr = (1 / 137) * self.c  # Bohr velocity ≈ 2.19e6 m/s
+        theta = np.arctan2(y_exp, x_exp) if x_exp != 0 or y_exp != 0 else 0.0
+        phi = np.arccos(z_exp / r_exp) if r_exp > 1e-11 else 0.0
+        vx = v_bohr * np.sin(phi) * np.cos(theta)
+        vy = v_bohr * np.sin(phi) * np.sin(theta)
+        vz = v_bohr * np.cos(phi)
+
+        # Sample position from quantum probability with small perturbation for hybrid dynamics
+        position_idx = np.random.choice(range(self.resolution), p=spinor_norm)
+        sampled_pos = self.fabric[position_idx, :3].copy()
+        alpha = 0.9  # Weight for expectation vs. sampled position
+        new_pos = alpha * np.array([x_exp, y_exp, z_exp], dtype=np.float32) + (1 - alpha) * sampled_pos
+
+        for p in self.particles:
+            if p['charge'] > 0:  # Proton (classical, static)
+                state = np.concatenate([p['position'][:3], p['velocity'][:3]])
+                t_range = np.linspace(0, dt, 2)
+                trajectory = odeint(self.equations_of_motion, state, t_range)
+                if np.any(np.isnan(trajectory)) or np.any(np.isinf(trajectory)):
+                    print(f"Warning: NaN or Inf detected in trajectory for particle at position {p['position']}")
+                    trajectory = np.nan_to_num(trajectory, nan=0.0, posinf=1e10, neginf=-1e10)
+                p['position'][:3] = trajectory[-1, :3]
+                p['velocity'][:3] = trajectory[-1, 3:]
+                p['path'].append(p['position'][:3].copy())
+            else:  # Electron (hybrid: dynamic update based on quantum probability and expectation)
+                # Update position to weighted combination of expectation and sampled position
+                p['position'][:3] = new_pos
+                p['path'].append(p['position'][:3].copy())
+                # Update velocity to maintain Bohr-like orbit, perturbed by quantum momentum
+                p['velocity'][:3] = np.array([vx, vy, vz], dtype=np.float32) * (1 + 0.1 * np.random.randn(3))  # Small random perturbation
+
+    def equations_of_motion(self, y, t):
+        # Simplified for particle motion in Coulomb potential in curved spacetime
+        x, y_coord, z, vx, vy, vz = y
+        i = self.find_closest_fabric_point(x, y_coord, z)
+        v2 = (vx**2 + vy**2 + vz**2) / self.c**2
+        if v2 >= 1:
+            print(f"Warning: Superluminal speed detected: v2={v2}")
+            v2 = 0.99  # Clamp to just below c
+        gamma = 1.0 / np.sqrt(1 - v2)
+        u = np.array([gamma, gamma*vx/self.c, gamma*vy/self.c, gamma*vz/self.c], dtype=np.float32)
+
+        # Coulomb force from proton at origin
+        r = np.sqrt(x**2 + y_coord**2 + z**2)
+        if r < 1e-11: r = 1e-11  # Avoid singularity
+        coulomb_force = -self.em['charge'] * 1.602e-19 / (4 * np.pi * self.eps_0 * r**2)  # F = -k * q1 * q2 / r^2
+        direction = np.array([x, y_coord, z]) / r
+        em_force = coulomb_force * direction
+
+        # Minimal gravitational acceleration (curved spacetime)
+        geo_accel = np.zeros(3, dtype=np.float32)
+        for spatial_dim in range(3):
+            Γ = self.christoffel[i, spatial_dim+1, :, :]
+            geo_accel[spatial_dim] = -np.einsum('ij,i,j', Γ, u, u) * self.c**2
+
+        mass = self.mass_q if self.em['charge'] > 0 else self.mass_e  # Use proton or electron mass
+        coordinate_accel = (em_force + geo_accel) / mass
+        coordinate_accel = np.clip(coordinate_accel, -1e10, 1e10)
+        return [vx, vy, vz, coordinate_accel[0], coordinate_accel[1], coordinate_accel[2]]
+
+    def find_closest_fabric_point(self, x, y, z):
+        r_point = np.sqrt(x**2 + y**2 + z**2)
+        i = np.argmin(np.abs(np.linalg.norm(self.fabric[:, :3], axis=1) - r_point))
+        return i
+
+    def total_stress_energy(self):
+        r = np.linalg.norm(self.fabric[:, :3], axis=1)
+        r = np.where(r < 1e-11, 1e-11, r)
+        phi_N = self.quantum['phi_N']
+        T = np.zeros((self.resolution, 4, 4), dtype=np.float32)
+        T[:, 0, 0] = -phi_N / self.c**2
+        
+        # Electromagnetic stress-energy from Coulomb field in curved spacetime
+        T_EM = np.einsum('...ij,...kj', self.em['F_munu'], self.em['F_munu']) * (1/(4*np.pi*self.eps_0))
+        T += T_EM
+        
+        # Minimal gravitational stress-energy (physical, negligible)
+        mass_term = 2 * self.G * self.mass_q / (self.c**2 * r)
+        T[:, 0, 0] -= mass_term / self.c**2
+        
+        # Disable strong and weak contributions (negligible)
+        self.stress_energy = T
+        return T
+
+    def add_particle(self, position, velocity, charge):
+        particle = {
+            'position': np.array(position, dtype=np.float32),
+            'velocity': np.array(velocity, dtype=np.float32),
+            'charge': charge,
+            'path': [position[:3].copy()]
+        }
+        self.particles.append(particle)
+
+    def visualize_unified_fields(self):
+        fig = plt.figure(figsize=(20, 16))
+        
+        ax1 = fig.add_subplot(221, projection='3d')
+        x, y, z = self.fabric[:, :3].T
+        ricci_proxy = self.metric[:, 0, 0]
+        sc1 = ax1.scatter(x, y, z, c=ricci_proxy, cmap='viridis')
+        ax1.set_title('Hydrogen Atom Spacetime Curvature')
+        ax1.set_xlabel('X (m)')
+        ax1.set_ylabel('Y (m)')
+        ax1.set_zlabel('Z (m)')
+        fig.colorbar(sc1, ax=ax1)
+
+        ax2 = fig.add_subplot(222)
+        spinor_norm = np.sum(np.abs(self.quantum['spinor'])**2, axis=1)
+        spinor_norm = np.nan_to_num(spinor_norm, nan=0.0, posinf=0.0, neginf=0.0)  # Handle NaN/Inf
+        ax2.plot(spinor_norm, label='Electron Wavefunction Norm')
+        ax2.set_title('Electron Probability Density (3D)')
+        ax2.set_xlabel('Point Index')
+        ax2.set_ylabel('Probability Density (arb. units)')
+        ax2.set_ylim(0, 1.5)  # Adjusted for larger initial amplitudes
+        ax2.legend()
+
+        ax3 = fig.add_subplot(223)
+        ax3.plot(self.fabric[:, 3], self.gw['plus'], label='+ Polarization')
+        ax3.plot(self.fabric[:, 3], self.gw['cross'], label='× Polarization')
+        ax3.set_title('Gravitational Waves (Minimal)')
+        ax3.set_xlabel('Time (s)')
+        ax3.set_ylabel('Amplitude (×10^-6)')
+        ax3.set_ylim(-1.5e-6, 1.5e-6)
+        ax3.legend()
+
+        ax4 = fig.add_subplot(224, projection='3d')
+        # Plot 3D fabric as a sphere
+        for (i, j), _ in self.edges:
+            ax4.plot([self.fabric[i, 0], self.fabric[j, 0]], 
+                     [self.fabric[i, 1], self.fabric[j, 1]], 
+                     [self.fabric[i, 2], self.fabric[j, 2]], 'r-', alpha=0.5)
+        # Plot particle paths in 3D (proton in red, electron in blue)
+        for p in self.particles:
+            path = np.array(p['path'])
+            color = 'red' if p['charge'] > 0 else 'blue'  # Proton in red, electron in blue
+            ax4.plot(path[:, 0], path[:, 1], path[:, 2], c=color, alpha=0.5, label='Proton' if p['charge'] > 0 else 'Electron')
+        ax4.set_title('Hydrogen Atom Structure & 3D Hybrid Electron Orbits')
+        ax4.set_xlabel('X (m)')
+        ax4.set_ylabel('Y (m)')
+        ax4.set_zlabel('Z (m)')
+        ax4.legend()
+        
+        plt.tight_layout()
+        plt.show()
+
+if __name__ == "__main__":
+    sim = UnifiedSpacetimeSimulator(resolution=30, lambda_=5.29e-11, kappa=0.1, charge_density=1e-19)
+    print(f"Number of edges: {len(sim.edges)}")
+    sim.evolve_system(steps=1000)  # Increased steps for better evolution
+    sim.visualize_unified_fields()
