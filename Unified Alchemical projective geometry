@@ -1,0 +1,544 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.integrate import solve_ivp
+from mpl_toolkits.mplot3d import Axes3D
+import warnings
+warnings.filterwarnings('ignore')
+
+class UnifiedSpacetimeSimulator:
+    def __init__(self, grid_size=5, lambda_=1.0, kappa=0.1, charge_density=1e-15):
+        self.grid_size = grid_size
+        self.resolution = grid_size ** 3
+        self.lambda_ = lambda_
+        self.kappa = kappa
+        self.charge_density = charge_density
+        self.beta = 0.1
+        self.g_strong = 1.0
+        self.g_weak = 0.65
+        self.mass_e = 9.11e-31
+        self.mass_q = 2.3e-30
+        self.c = 3e8
+        self.hbar = 1.0545718e-34
+        self.eps_0 = 8.854187817e-12
+        self.mu_0 = 4 * np.pi * 1e-7
+        self.G = 6.67430e-11
+        self.friction = 0.1
+        self.polarizability = 6e-40  # Calibrated for NaCl-like crystal
+        self.conductivity = 1e-12    # Calibrated for insulator
+        self.alchemical_temp = 300.0  # Base temperature (K) for "fire"
+
+        self.dx = 4.0 / (self.grid_size - 1)
+        self.dt = 1e-3
+        self.time = 0.0
+        self.times = []  # For time crystal visualization
+        self.spinor_norms = []
+
+        self.schumann_freqs = [7.83, 14.3, 20.8, 27.3, 33.8]
+        self.schumann_amplitudes = [1.0, 0.5, 0.33, 0.25, 0.2]
+        self.pythagorean_ratios = [1.0, 2.0, 3/2, 4/3]
+
+        self.alchemical_states = ['Sulphur', 'Mercury', 'Salt', 'Antimony', 'Cinnabar', 'Common Salt',
+                                'Nitre', 'Alum', 'Ammoniac Salt', 'Gem Salt', 'Rust', 'Tufa',
+                                'Galena', 'Bismuth', 'Cadmia', 'Calamine', 'Sphalerite', 'Aqua']
+        self.transformed_states = ['Gold', 'Silver', 'Copper', 'Iron', 'Tin', 'Lead', 'Mercury', 'Sulphur']
+
+        self.thermal_diffusivity = 1e-6  # Thermal diffusivity (m²/s) for alchemical "fire"
+        self.temp_field = np.ones(self.resolution) * self.alchemical_temp  # Temperature field (K)
+
+        # Spatial partitioning for performance
+        self.cell_size = 1.0
+        self.cells = {}
+        self._initialize_cells()
+
+        self.fabric, self.edges, self.planes = self.generate_spacetime_fabric()
+        self.quantum = self.init_quantum_fields()
+        self.metric = self.compute_metric()
+        self.christoffel = self.compute_christoffel_symbols_analytical()
+        self.em = self.init_em_fields()
+        self.strong = self.init_strong_fields()
+        self.weak = self.init_weak_fields()
+        self.gw = self.init_gravitational_waves()
+        self.stress_energy = np.zeros((self.resolution, 4, 4), dtype=np.float32)
+        self.polarization = np.zeros((self.resolution, 3), dtype=np.float32)
+        self.current_density = np.zeros((self.resolution, 3), dtype=np.float32)
+        self.alchemical_phase = np.random.choice(self.alchemical_states, self.resolution)
+        self.particles = []
+
+    def _initialize_cells(self):
+        """Initialize spatial partitioning cells."""
+        for i in range(self.resolution):
+            pos = self.fabric[i, :3]
+            cell_x = int(pos[0] / self.cell_size)
+            cell_y = int(pos[1] / self.cell_size)
+            cell_z = int(pos[2] / self.cell_size)
+            cell_key = (cell_x, cell_y, cell_z)
+            if cell_key not in self.cells:
+                self.cells[cell_key] = []
+            self.cells[cell_key].append(i)
+
+    def generate_spacetime_fabric(self):
+        x = np.linspace(-2, 2, self.grid_size)
+        y = np.linspace(-2, 2, self.grid_size)
+        z = np.linspace(-2, 2, self.grid_size)
+        X, Y, Z = np.meshgrid(x, y, z)
+        fabric = np.stack([X.flatten(), Y.flatten(), Z.flatten(), np.zeros(self.resolution)], axis=1).astype(np.float32)
+        edges = []
+        spins = []
+        planes = []
+
+        # Define edges as straights
+        for i in range(self.resolution):
+            ix, iy, iz = np.unravel_index(i, (self.grid_size, self.grid_size, self.grid_size))
+            for dx, dy, dz in [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)]:
+                jx, jy, jz = ix + dx, iy + dy, iz + dz
+                if 0 <= jx < self.grid_size and 0 <= jy < self.grid_size and 0 <= jz < self.grid_size:
+                    j = np.ravel_multi_index((jx, jy, jz), (self.grid_size, self.grid_size, self.grid_size))
+                    edges.append((i, j))
+                    spins.append(np.random.choice([0.5, 1.0]))
+
+        # Define planes using all non-collinear triplets (improved)
+        for i in range(self.resolution):
+            for j in range(i + 1, self.resolution):
+                for k in range(j + 1, self.resolution):
+                    p1, p2, p3 = fabric[i, :3], fabric[j, :3], fabric[k, :3]
+                    v1, v2 = p2 - p1, p3 - p1
+                    cross = np.cross(v1, v2)
+                    if np.linalg.norm(cross) > 1e-6:  # Non-collinear check
+                        planes.append((i, j, k))
+                        if len(planes) > 1000:  # Limit for performance
+                            break
+                if len(planes) > 1000:
+                    break
+            if len(planes) > 1000:
+                break
+
+        return fabric, list(zip(edges, spins)), planes
+
+    def init_quantum_fields(self):
+        r = np.linalg.norm(self.fabric[:, :3], axis=1)
+        phi_N = (self.lambda_ / self.kappa) * (1 - np.exp(-r**2 / self.lambda_**2))
+        return {
+            'spinor': np.random.normal(0, 1e-3, (self.resolution, 4)).astype(np.complex64),
+            'quark_spinors': np.random.normal(0, 1e-3, (self.resolution, 2, 3, 4)).astype(np.complex64),
+            'phi_N': phi_N.astype(np.float32)
+        }
+
+    def compute_metric(self):
+        metric = np.tile(np.eye(4, dtype=np.float32)[np.newaxis, :, :], (self.resolution, 1, 1))
+        r = np.linalg.norm(self.fabric[:, :3], axis=1)
+        r = np.where(r < 1e-6, 1e-6, r)
+        phi_N = self.quantum['phi_N'][:, np.newaxis, np.newaxis]
+        mass_term = 2 * self.G * 1.0 / (self.c**2 * r)  # Adjusted mass (1 kg)
+        charge_term = (self.em['charge'] * self.lambda_ / (4 * np.pi * self.eps_0 * r**2))**2
+        for i in range(self.resolution):
+            metric[i, 0, 0] = -(1 - mass_term[i] + charge_term[i]) * (1 + self.kappa * phi_N[i])
+            metric[i, 1, 1] = 1 / (1 - mass_term[i] + charge_term[i])
+            metric[i, 2, 2] = r[i]**2 * (1 + self.kappa * phi_N[i])
+            metric[i, 3, 3] = metric[i, 2, 2] * np.sin(self.fabric[i, 2])**2
+            metric[i, 0, 3] = 0.27 * self.lambda_ * np.exp(-r[i] / self.lambda_)
+            metric[i, 3, 0] = metric[i, 0, 3]
+        return metric
+
+    def compute_christoffel_symbols_analytical(self, h=1e-4):
+        christoffel = np.zeros((self.resolution, 4, 4, 4), dtype=np.float32)
+        for i in range(self.resolution):
+            if np.linalg.norm(self.fabric[i, :3]) < 0.1:
+                continue
+            for mu in range(4):
+                for nu in range(4):
+                    for sigma in range(4):
+                        # 4th-order finite difference
+                        ip2 = (i + 2) % self.resolution
+                        ip1 = (i + 1) % self.resolution
+                        im1 = (i - 1) % self.resolution
+                        im2 = (i - 2) % self.resolution
+                        dg_mu = (-self.metric[ip2, mu, nu] + 8 * self.metric[ip1, mu, nu] - 
+                                 8 * self.metric[im1, mu, nu] + self.metric[im2, mu, nu]) / (12 * h + 1e-6)
+                        dg_nu = (-self.metric[ip2, nu, mu] + 8 * self.metric[ip1, nu, mu] - 
+                                 8 * self.metric[im1, nu, mu] + self.metric[im2, nu, mu]) / (12 * h + 1e-6)
+                        dg_sigma = (-self.metric[ip2, mu, nu] + 8 * self.metric[ip1, mu, nu] - 
+                                    8 * self.metric[im1, mu, nu] + self.metric[im2, mu, nu]) / (12 * h + 1e-6)
+                        christoffel[i, mu, nu, sigma] = 0.5 * (dg_mu + dg_nu - dg_sigma)
+        return christoffel
+
+    def init_em_fields(self):
+        return {
+            'A_mu': np.zeros((self.resolution, 4), dtype=np.float32),
+            'F_munu': np.zeros((self.resolution, 4, 4), dtype=np.float32),
+            'charge': 1.602e-19
+        }
+
+    def init_strong_fields(self):
+        return {
+            'A_mu': np.zeros((self.resolution, 8, 4), dtype=np.float32),
+            'F_munu': np.zeros((self.resolution, 8, 4, 4), dtype=np.float32)
+        }
+
+    def init_weak_fields(self):
+        return {
+            'W_mu': np.zeros((self.resolution, 3, 4), dtype=np.float32),
+            'W_munu': np.zeros((self.resolution, 3, 4, 4), dtype=np.float32),
+            'higgs': np.ones(self.resolution, dtype=np.float32) * 246e9 / self.c
+        }
+
+    def init_gravitational_waves(self):
+        t = self.fabric[:, 3]
+        f_schumann = 7.83
+        return {
+            'plus': 1e-6 * np.sin(2 * np.pi * f_schumann * t),
+            'cross': 1e-6 * np.cos(2 * np.pi * f_schumann * t)
+        }
+
+    def compute_vierbein(self, g_mu_nu):
+        e_a_mu = np.zeros((4, 4), dtype=np.float64)
+        for mu in range(4):
+            e_a_mu[mu, mu] = np.sqrt(np.abs(g_mu_nu[mu, mu]))
+        return e_mu_a
+
+    def dirac_gamma_matrices(self, g_mu_nu):
+        gamma_flat = [
+            np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, -1, 0], [0, 0, 0, -1]], dtype=np.complex64),
+            np.array([[0, 0, 0, 1], [0, 0, 1, 0], [0, -1, 0, 0], [-1, 0, 0, 0]], dtype=np.complex64),
+            np.array([[0, 0, 0, -1j], [0, 0, 1j, 0], [0, 1j, 0, 0], [-1j, 0, 0, 0]], dtype=np.complex64),
+            np.array([[0, 0, 1, 0], [0, 0, 0, -1], [-1, 0, 0, 0], [0, 1, 0, 0]], dtype=np.complex64)
+        ]
+        e_a_mu = self.compute_vierbein(g_mu_nu)
+        e_mu_a = np.linalg.inv(e_a_mu)
+        gamma_mu = [sum(e_mu_a[mu, a] * gamma_flat[a] for a in range(4)) for mu in range(4)]
+        return gamma_mu
+
+    def gell_mann_matrices(self):
+        return [
+            np.array([[0, 1, 0], [1, 0, 0], [0, 0, 0]], dtype=np.complex64),
+            np.array([[0, -1j, 0], [1j, 0, 0], [0, 0, 0]], dtype=np.complex64),
+            np.array([[1, 0, 0], [0, -1, 0], [0, 0, 0]], dtype=np.complex64),
+            np.array([[0, 0, 1], [0, 0, 0], [1, 0, 0]], dtype=np.complex64),
+            np.array([[0, 0, -1j], [0, 0, 0], [1j, 0, 0]], dtype=np.complex64),
+            np.array([[0, 0, 0], [0, 0, 1], [0, 1, 0]], dtype=np.complex64),
+            np.array([[0, 0, 0], [0, 0, -1j], [0, 1j, 0]], dtype=np.complex64),
+            np.array([[1, 0, 0], [0, 1, 0], [0, 0, -2]], dtype=np.complex64) / np.sqrt(3)
+        ]
+
+    def covariant_derivative(self, psi, i, mu):
+        if mu != 0:
+            psi_plus = self.quantum['spinor'][(i + 1) % self.resolution] if i + 1 < self.resolution else psi
+            psi_minus = self.quantum['spinor'][(i - 1) % self.resolution] if i - 1 >= 0 else psi
+            partial_psi = (psi_plus - psi_minus) / (2 * self.dx)
+            harmonic_scale = self.pythagorean_ratios[mu % len(self.pythagorean_ratios)]
+            partial_psi *= harmonic_scale
+        else:
+            partial_psi = 0
+        Gamma_mu = self.christoffel[i, mu]
+        connection_term = np.dot(Gamma_mu, psi)
+        return partial_psi + connection_term
+
+    def schumann_potential(self, t):
+        V_0 = 1e-6
+        V_t = 0
+        for fn, An in zip(self.schumann_freqs, self.schumann_amplitudes):
+            V_t += V_0 * An * np.cos(2 * np.pi * fn * t)
+        return V_t
+
+    def dirac_hamiltonian(self, psi, i, t, quark=False, flavor=None, color=None):
+        gamma_mu = self.dirac_gamma_matrices(self.metric[i])
+        H_psi = np.zeros(4, dtype=np.complex64)
+        mass = self.mass_q if quark else self.mass_e
+        for mu in range(1, 4):
+            D_mu_psi = self.covariant_derivative(psi, i, mu)
+            H_psi -= 1j * self.c * gamma_mu[0] @ gamma_mu[mu] @ D_mu_psi
+        H_psi += (mass * self.c**2 / self.hbar) * gamma_mu[0] @ psi
+        H_psi -= 1j * self.em['charge'] * sum(self.em['A_mu'][i, mu] * gamma_mu[mu] @ psi for mu in range(4))
+        V_schumann = self.schumann_potential(t)
+        H_psi += V_schumann * psi
+        # Add alchemical temperature influence
+        temp_factor = (self.temp_field[i] - self.alchemical_temp) / self.alchemical_temp
+        H_psi += 1e-6 * temp_factor * psi
+        if quark and flavor is not None and color is not None:
+            T_a = self.gell_mann_matrices()
+            strong_term = -1j * self.g_strong * sum(self.strong['A_mu'][i, a, mu] * T_a[a] @ psi 
+                                                    for a in range(8) for mu in range(4))
+            H_psi += strong_term
+        return H_psi
+
+    def dirac_rhs(self, t, psi_flat, i, quark=False, flavor=None, color=None):
+        psi = psi_flat.reshape(4) if not quark else psi_flat.reshape(4)
+        H_psi = self.dirac_hamiltonian(psi, i, t, quark, flavor, color)
+        return (-1j * H_psi / self.hbar).flatten()
+
+    def evolve_quantum_field(self):
+        dt = self.dt
+        for i in range(self.resolution):
+            t_span = (self.time, self.time + dt)
+            psi = self.quantum['spinor'][i]
+            sol = solve_ivp(self.dirac_rhs, t_span, psi.flatten(), method='RK45', args=(i,))
+            self.quantum['spinor'][i] = sol.y[:, -1].reshape(4)
+
+            for flavor in range(2):
+                for color in range(3):
+                    psi_q = self.quantum['quark_spinors'][i, flavor, color]
+                    sol_q = solve_ivp(self.dirac_rhs, t_span, psi_q.flatten(), method='RK45', 
+                                     args=(i, True, flavor, color))
+                    self.quantum['quark_spinors'][i, flavor, color] = sol_q.y[:, -1].reshape(4)
+        
+        # Record spinor norm for time crystal visualization
+        spinor_norm = np.sum(np.abs(self.quantum['spinor'])**2, axis=1)
+        self.spinor_norms.append(np.mean(spinor_norm))
+        self.times.append(self.time)
+        self.time += dt
+
+    def evolve_temperature_field(self):
+        """Evolve temperature field using the heat equation."""
+        new_temp = self.temp_field.copy()
+        for i in range(self.resolution):
+            ix, iy, iz = np.unravel_index(i, (self.grid_size, self.grid_size, self.grid_size))
+            laplacian = 0
+            for dx, dy, dz in [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)]:
+                jx, jy, jz = ix + dx, iy + dy, iz + dz
+                if 0 <= jx < self.grid_size and 0 <= jy < self.grid_size and 0 <= jz < self.grid_size:
+                    j = np.ravel_multi_index((jx, jy, jz), (self.grid_size, self.grid_size, self.grid_size))
+                    laplacian += self.temp_field[j] - self.temp_field[i]
+            laplacian /= (self.dx ** 2)
+            new_temp[i] += self.thermal_diffusivity * laplacian * self.dt
+            # Add sinusoidal heating for alchemical "fire"
+            new_temp[i] += 10.0 * np.sin(2 * np.pi * 7.83 * self.time)
+        self.temp_field = new_temp
+
+    def compute_em_field(self):
+        E_field = np.zeros((self.resolution, 3), dtype=np.float32)
+        B_field = np.zeros((self.resolution, 3), dtype=np.float32)
+
+        # Vectorized computation using spatial partitioning
+        for cell_key, indices in self.cells.items():
+            cx, cy, cz = cell_key
+            nearby_cells = [(cx + dx, cy + dy, cz + dz) 
+                            for dx in [-1, 0, 1] for dy in [-1, 0, 1] for dz in [-1, 0, 1]]
+            for i in indices:
+                r_i = self.fabric[i, :3]
+                for cell in nearby_cells:
+                    if cell not in self.cells:
+                        continue
+                    for j in self.cells[cell]:
+                        for p in self.particles:
+                            if np.linalg.norm(p['position'][:3] - self.fabric[j, :3]) < 1e-6:
+                                r_p = p['position'][:3]
+                                r_diff = r_p - r_i
+                                r_norm = np.linalg.norm(r_diff)
+                                if r_norm > 1e-6:
+                                    E_field[i] += (p['charge'] * r_diff) / (4 * np.pi * self.eps_0 * r_norm**3)
+                                    v = p['velocity'][:3]
+                                    B_field[i] += (self.mu_0 * p['charge'] * np.cross(v, r_diff)) / (4 * np.pi * r_norm**3)
+
+        # Projective geometry: Propagate fields along straights
+        for i in range(self.resolution):
+            for edge, _ in self.edges:
+                if edge[0] == i:
+                    j = edge[1]
+                    r_j = self.fabric[j, :3]
+                    r_diff = r_j - r_i
+                    r_norm = np.linalg.norm(r_diff)
+                    if r_norm > 1e-6:
+                        direction = r_diff / r_norm
+                        E_field[i] += 0.1 * np.dot(E_field[i], direction) * direction
+                        B_field[i] += 0.1 * np.dot(B_field[i], direction) * direction
+
+        # Apply alchemical temperature influence
+        temp_factor = (self.temp_field - self.alchemical_temp) / self.alchemical_temp
+        adjusted_polarizability = self.polarizability * (1 + 0.1 * temp_factor)
+        adjusted_conductivity = self.conductivity * (1 + 0.1 * temp_factor)
+
+        self.polarization = adjusted_polarizability[:, np.newaxis] * E_field
+        self.current_density = adjusted_conductivity[:, np.newaxis] * E_field
+
+        # Update F_munu
+        for i in range(self.resolution):
+            self.em['F_munu'][i, 1:4, 0] = E_field[i]
+            self.em['F_munu'][i, 0, 1:4] = -E_field[i]
+            self.em['F_munu'][i, 1, 2] = B_field[i, 2]
+            self.em['F_munu'][i, 2, 1] = -B_field[i, 2]
+            self.em['F_munu'][i, 2, 3] = B_field[i, 0]
+            self.em['F_munu'][i, 3, 2] = -B_field[i, 0]
+            self.em['F_munu'][i, 3, 1] = B_field[i, 1]
+            self.em['F_munu'][i, 1, 3] = -B_field[i, 1]
+
+    def alchemical_transformation(self):
+        for i in range(self.resolution):
+            E_norm = np.linalg.norm(self.em['F_munu'][i, 1:4, 0])
+            temp_threshold = self.alchemical_temp + 10.0
+            if E_norm > 1e-5 and self.temp_field[i] > temp_threshold:
+                current_state = self.alchemical_phase[i]
+                if current_state in self.alchemical_states:
+                    idx = self.alchemical_states.index(current_state)
+                    new_idx = min(idx + 1, len(self.transformed_states) - 1)
+                    self.alchemical_phase[i] = self.transformed_states[new_idx]
+
+    def project_point_to_straight(self, point, straight_start, straight_end):
+        p = point[:3]
+        a = straight_start[:3]
+        b = straight_end[:3]
+        ab = b - a
+        ap = p - a
+        t = np.dot(ap, ab) / np.dot(ab, ab)
+        # Removed clipping to allow projection onto infinite straight
+        projection = a + t * ab
+        return np.concatenate([projection, point[3:]])
+
+    def perspective_transform(self, point, focal_length=5.0):
+        """Apply a simple perspective projection."""
+        x, y, z, t = point
+        z = max(z, 1e-6)  # Avoid division by zero
+        factor = focal_length / (focal_length + z)
+        x_proj = x * factor
+        y_proj = y * factor
+        return np.array([x_proj, y_proj, z, t], dtype=np.float32)
+
+    def equations_of_motion(self, t, y, i):
+        x, y_coord, z, vx, vy, vz = y
+        v2 = (vx**2 + vy**2 + vz**2) / self.c**2
+        gamma = 1.0 / np.sqrt(1 - v2) if v2 < 1 else 1.0
+        u = np.array([gamma, gamma*vx/self.c, gamma*vy/self.c, gamma*vz/self.c], dtype=np.float32)
+
+        # Project position with perspective transform
+        point = np.array([x, y_coord, z, 0])
+        point = self.perspective_transform(point)
+
+        # Projective geometry: Constrain motion to nearest straight
+        closest_edge = None
+        min_dist = float('inf')
+        for edge, _ in self.edges:
+            if edge[0] == i or edge[1] == i:
+                start = self.fabric[edge[0]]
+                end = self.fabric[edge[1]]
+                proj = self.project_point_to_straight(point, start, end)
+                dist = np.linalg.norm(proj[:3] - point[:3])
+                if dist < min_dist:
+                    min_dist = dist
+                    closest_edge = (start, end)
+        
+        if closest_edge:
+            start, end = closest_edge
+            direction = (end - start)[:3]
+            direction = direction / np.linalg.norm(direction)
+            velocity = np.array([vx, vy, vz])
+            velocity = np.dot(velocity, direction) * direction
+            vx, vy, vz = velocity
+
+        geo_accel = np.zeros(3, dtype=np.float32)
+        for spatial_dim in range(3):
+            Γ = self.christoffel[i, spatial_dim+1, :, :]
+            geo_accel[spatial_dim] = -np.einsum('ij,i,j', Γ, u, u) * self.c**2
+
+        em_force = self.em['charge'] * np.einsum('ij,j', self.em['F_munu'][i, 1:4, :], u)[:3]
+        friction_force = -self.friction * np.array([vx, vy, vz], dtype=np.float32)
+
+        coordinate_accel = (geo_accel + em_force + friction_force) / (self.mass_e * gamma**2)
+        coordinate_accel = np.clip(coordinate_accel, -1e10, 1e10)
+        return [vx, vy, vz, coordinate_accel[0], coordinate_accel[1], coordinate_accel[2]]
+
+    def find_closest_fabric_point(self, x, y, z):
+        r_point = np.sqrt(x**2 + y**2 + z**2)
+        i = np.argmin(np.abs(np.linalg.norm(self.fabric[:, :3], axis=1) - r_point))
+        return i
+
+    def total_stress_energy(self):
+        r = np.linalg.norm(self.fabric[:, :3], axis=1)
+        r = np.where(r < 1e-6, 1e-6, r)
+        phi_N = self.quantum['phi_N']
+        T = np.zeros((self.resolution, 4, 4), dtype=np.float32)
+        T[:, 0, 0] = -phi_N / self.c**2
+        T_EM = np.einsum('...ij,...kj', self.em['F_munu'], self.em['F_munu']) * (1/(4*np.pi*self.eps_0))
+        for i in range(self.resolution):
+            T_EM[i, 1:4, 0] += self.polarization[i] / self.eps_0
+            T_EM[i, 0, 1:4] -= self.current_density[i] / self.c
+        T += T_EM
+        return T
+
+    def evolve_system(self, steps=100):
+        for _ in range(steps):
+            self.evolve_quantum_field()
+            self.evolve_temperature_field()
+            self.compute_em_field()
+            self.alchemical_transformation()
+            self.move_charged_particles(self.dt)
+            t = self.fabric[:, 3] + self.time
+            self.gw['plus'] = 1e-6 * np.sin(2 * np.pi * 7.83 * t)
+            self.gw['cross'] = 1e-6 * np.cos(2 * np.pi * 7.83 * t)
+            self.metric = self.compute_metric()
+            self.christoffel = self.compute_christoffel_symbols_analytical()
+            self.stress_energy = self.total_stress_energy()
+
+    def move_charged_particles(self, dt):
+        for idx, p in enumerate(self.particles):
+            i = self.find_closest_fabric_point(*p['position'][:3])
+            state = np.concatenate([p['position'][:3], p['velocity'][:3]])
+            t_span = (0, dt)
+            sol = solve_ivp(self.equations_of_motion, t_span, state, method='RK45', args=(i,))
+            p['position'][:3] = sol.y[:3, -1]
+            p['velocity'][:3] = sol.y[3:, -1]
+            p['path'].append(p['position'][:3].copy())
+
+    def add_particle(self, position, velocity, charge):
+        particle = {
+            'position': np.array(position, dtype=np.float32),
+            'velocity': np.array(velocity, dtype=np.float32),
+            'charge': charge,
+            'path': [position[:3].copy()]
+        }
+        self.particles.append(particle)
+
+    def initialize_crystal_particles(self):
+        for i in range(self.resolution):
+            ix, iy, iz = np.unravel_index(i, (self.grid_size, self.grid_size, self.grid_size))
+            charge = self.em['charge'] if (ix + iy + iz) % 2 == 0 else -self.em['charge']
+            velocity = 0.1 * self.c * np.random.randn(4).astype(np.float32)
+            self.add_particle(self.fabric[i], velocity, charge)
+
+    def visualize_unified_fields(self):
+        fig = plt.figure(figsize=(20, 20))
+        
+        ax1 = fig.add_subplot(321, projection='3d')
+        x, y, z = self.fabric[:, :3].T
+        ricci_proxy = np.diag(self.metric[:, 0, 0])
+        sc1 = ax1.scatter(x, y, z, c=ricci_proxy, cmap='viridis')
+        ax1.set_title('Spacetime Curvature (Full GR)')
+        fig.colorbar(sc1, ax=ax1)
+
+        ax2 = fig.add_subplot(322)
+        ax2.plot(self.times, self.spinor_norms, label='Mean Spinor Norm')
+        ax2.set_title('Time Crystal Oscillations')
+        ax2.set_xlabel('Time (s)')
+        ax2.set_ylabel('Spinor Norm')
+        ax2.legend()
+
+        ax3 = fig.add_subplot(323, projection='3d')
+        pol_norm = np.linalg.norm(self.polarization, axis=1)
+        sc3 = ax3.scatter(x, y, z, c=pol_norm, cmap='plasma')
+        ax3.set_title('Lattice Polarization Magnitude (Alchemical Influence)')
+        fig.colorbar(sc3, ax=ax3)
+
+        ax4 = fig.add_subplot(324, projection='3d')
+        for (i, j, k) in self.planes[:50]:  # Visualize planes
+            verts = [self.fabric[i, :3], self.fabric[j, :3], self.fabric[k, :3]]
+            ax4.plot_trisurf([verts[0][0], verts[1][0], verts[2][0]],
+                             [verts[0][1], verts[1][1], verts[2][1]],
+                             [verts[0][2], verts[1][2], verts[2][2]], alpha=0.1, color='green')
+        ax4.set_title('Projective Planes (Junctions)')
+        
+        ax5 = fig.add_subplot(325, projection='3d')
+        for (i, j), _ in self.edges[:50]:
+            ax5.plot([self.fabric[i, 0], self.fabric[j, 0]], 
+                     [self.fabric[i, 1], self.fabric[j, 1]], 
+                     [self.fabric[i, 2], self.fabric[j, 2]], 'r-', alpha=0.2)
+        for i, p in enumerate(self.particles):
+            path = np.array(p['path'])
+            color = 'blue' if self.alchemical_phase[i] in self.transformed_states else 'gray'
+            ax5.plot(path[:, 0], path[:, 1], path[:, 2], c=color, alpha=0.5)
+        ax5.set_title('Projective Lattice & Alchemical Transformation Paths')
+        
+        plt.tight_layout()
+        plt.show()
+
+if __name__ == "__main__":
+    sim = UnifiedSpacetimeSimulator(grid_size=5, lambda_=1.0, kappa=0.1, charge_density=1e-15)
+    sim.initialize_crystal_particles()
+    sim.evolve_system(steps=100)
+    sim.visualize_unified_fields()
