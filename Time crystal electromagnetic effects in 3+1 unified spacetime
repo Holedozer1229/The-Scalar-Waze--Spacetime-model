@@ -1,0 +1,383 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.integrate import odeint
+from mpl_toolkits.mplot3d import Axes3D
+import warnings
+warnings.filterwarnings('ignore')
+
+class UnifiedSpacetimeSimulator:
+    def __init__(self, grid_size=5, lambda_=1.0, kappa=0.1, charge_density=1e-15):
+        self.grid_size = grid_size  # Points per dimension for 3D grid
+        self.resolution = grid_size ** 3  # Total points in 3D grid
+        self.lambda_ = lambda_
+        self.kappa = kappa
+        self.charge_density = charge_density
+        self.beta = 0.1  # Immirzi parameter
+        self.g_strong = 1.0
+        self.g_weak = 0.65
+        self.mass_e = 9.11e-31  # Electron mass (kg)
+        self.mass_q = 2.3e-30   # Quark mass (kg)
+        self.c = 3e8            # Speed of light (m/s)
+        self.hbar = 1.0545718e-34  # Reduced Planck constant (J·s)
+        self.eps_0 = 8.854187817e-12  # Permittivity of free space (F/m)
+        self.mu_0 = 4 * np.pi * 1e-7  # Permeability of free space (H/m)
+        self.G = 6.67430e-11    # Gravitational constant (m³/kg/s²)
+        self.friction = 0.1     # Friction coefficient for crystal formation
+        self.polarizability = 1e-40  # Polarizability (C²m²/N), typical for ionic crystals
+        self.conductivity = 1e-10    # Conductivity (S/m), low for insulator-like crystal
+
+        self.dx = 4.0 / (self.grid_size - 1)  # Spatial step (m)
+        self.dt = 1e-3  # Time step (s)
+        self.time = 0.0  # Current simulation time (s)
+
+        # Schumann resonance frequencies (Hz)
+        self.schumann_freqs = [7.83, 14.3, 20.8, 27.3, 33.8]
+        self.schumann_amplitudes = [1.0, 0.5, 0.33, 0.25, 0.2]
+        
+        # Pythagorean harmonic ratios
+        self.pythagorean_ratios = [1.0, 2.0, 3/2, 4/3]
+
+        self.fabric, self.edges = self.generate_spacetime_fabric()
+        self.quantum = self.init_quantum_fields()
+        self.metric = self.compute_metric()
+        self.christoffel = self.compute_christoffel_symbols_analytical()
+        self.em = self.init_em_fields()
+        self.strong = self.init_strong_fields()
+        self.weak = self.init_weak_fields()
+        self.gw = self.init_gravitational_waves()
+        self.stress_energy = np.zeros((self.resolution, 4, 4), dtype=np.float32)
+        self.polarization = np.zeros((self.resolution, 3), dtype=np.float32)  # Lattice polarization
+        self.current_density = np.zeros((self.resolution, 3), dtype=np.float32)  # Lattice current density
+        self.particles = []
+
+    def generate_spacetime_fabric(self):
+        x = np.linspace(-2, 2, self.grid_size)
+        y = np.linspace(-2, 2, self.grid_size)
+        z = np.linspace(-2, 2, self.grid_size)
+        X, Y, Z = np.meshgrid(x, y, z)
+        fabric = np.stack([X.flatten(), Y.flatten(), Z.flatten(), np.zeros(self.resolution)], axis=1).astype(np.float32)
+        edges = []
+        spins = []
+        for i in range(self.resolution):
+            ix, iy, iz = np.unravel_index(i, (self.grid_size, self.grid_size, self.grid_size))
+            for dx, dy, dz in [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)]:
+                jx, jy, jz = ix + dx, iy + dy, iz + dz
+                if 0 <= jx < self.grid_size and 0 <= jy < self.grid_size and 0 <= jz < self.grid_size:
+                    j = np.ravel_multi_index((jx, jy, jz), (self.grid_size, self.grid_size, self.grid_size))
+                    edges.append((i, j))
+                    spins.append(np.random.choice([0.5, 1.0]))
+        return fabric, list(zip(edges, spins))
+
+    def init_quantum_fields(self):
+        r = np.linalg.norm(self.fabric[:, :3], axis=1)
+        phi_N = (self.lambda_ / self.kappa) * (1 - np.exp(-r**2 / self.lambda_**2))
+        return {
+            'spinor': np.random.normal(0, 1e-3, (self.resolution, 4)).astype(np.complex64),
+            'quark_spinors': np.random.normal(0, 1e-3, (self.resolution, 2, 3, 4)).astype(np.complex64),
+            'phi_N': phi_N.astype(np.float32)
+        }
+
+    def compute_metric(self):
+        metric = np.tile(np.eye(4, dtype=np.float32)[np.newaxis, :, :], (self.resolution, 1, 1))
+        r = np.linalg.norm(self.fabric[:, :3], axis=1)
+        r = np.where(r < 1e-6, 1e-6, r)
+        phi_N = self.quantum['phi_N'][:, np.newaxis, np.newaxis]
+        mass_term = 2 * self.G * 1.989e30 / (self.c**2 * r)  # Sun-like mass for GR effect
+        charge_term = (self.em['charge'] * self.lambda_ / (4 * np.pi * self.eps_0 * r**2))**2
+        for i in range(self.resolution):
+            metric[i, 0, 0] = -(1 - mass_term[i] + charge_term[i]) * (1 + self.kappa * phi_N[i])
+            metric[i, 1, 1] = 1 / (1 - mass_term[i] + charge_term[i])
+            metric[i, 2, 2] = r[i]**2 * (1 + self.kappa * phi_N[i])
+            metric[i, 3, 3] = metric[i, 2, 2] * np.sin(self.fabric[i, 2])**2
+            metric[i, 0, 3] = 0.27 * self.lambda_ * np.exp(-r[i] / self.lambda_)
+            metric[i, 3, 0] = metric[i, 0, 3]
+        return metric
+
+    def compute_christoffel_symbols_analytical(self, h=1e-4):
+        christoffel = np.zeros((self.resolution, 4, 4, 4), dtype=np.float32)
+        for i in range(self.resolution):
+            if np.linalg.norm(self.fabric[i, :3]) < 0.1:
+                continue
+            for mu in range(4):
+                for nu in range(4):
+                    for sigma in range(4):
+                        dg_mu = (self.metric[(i+1)%self.resolution, mu, nu] - 
+                                 self.metric[(i-1)%self.resolution, mu, nu]) / (2*h + 1e-6)
+                        dg_nu = (self.metric[(i+1)%self.resolution, nu, mu] - 
+                                 self.metric[(i-1)%self.resolution, nu, mu]) / (2*h + 1e-6)
+                        dg_sigma = (self.metric[(i+1)%self.resolution, mu, nu] - 
+                                    self.metric[(i-1)%self.resolution, mu, nu]) / (2*h + 1e-6)
+                        christoffel[i, mu, nu, sigma] = 0.5 * (dg_mu + dg_nu - dg_sigma)
+        return christoffel
+
+    def init_em_fields(self):
+        return {
+            'A_mu': np.zeros((self.resolution, 4), dtype=np.float32),
+            'F_munu': np.zeros((self.resolution, 4, 4), dtype=np.float32),
+            'charge': 1.602e-19  # Elementary charge
+        }
+
+    def init_strong_fields(self):
+        return {
+            'A_mu': np.zeros((self.resolution, 8, 4), dtype=np.float32),
+            'F_munu': np.zeros((self.resolution, 8, 4, 4), dtype=np.float32)
+        }
+
+    def init_weak_fields(self):
+        return {
+            'W_mu': np.zeros((self.resolution, 3, 4), dtype=np.float32),
+            'W_munu': np.zeros((self.resolution, 3, 4, 4), dtype=np.float32),
+            'higgs': np.ones(self.resolution, dtype=np.float32) * 246e9 / self.c
+        }
+
+    def init_gravitational_waves(self):
+        t = self.fabric[:, 3]
+        f_schumann = 7.83  # Hz for time crystal periodicity
+        return {
+            'plus': 1e-6 * np.sin(2 * np.pi * f_schumann * t),
+            'cross': 1e-6 * np.cos(2 * np.pi * f_schumann * t)
+        }
+
+    def compute_vierbein(self, g_mu_nu):
+        e_a_mu = np.zeros((4, 4), dtype=np.float64)
+        for mu in range(4):
+            e_a_mu[mu, mu] = np.sqrt(np.abs(g_mu_nu[mu, mu]))
+        return e_a_mu
+
+    def dirac_gamma_matrices(self, g_mu_nu):
+        gamma_flat = [
+            np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, -1, 0], [0, 0, 0, -1]], dtype=np.complex64),
+            np.array([[0, 0, 0, 1], [0, 0, 1, 0], [0, -1, 0, 0], [-1, 0, 0, 0]], dtype=np.complex64),
+            np.array([[0, 0, 0, -1j], [0, 0, 1j, 0], [0, 1j, 0, 0], [-1j, 0, 0, 0]], dtype=np.complex64),
+            np.array([[0, 0, 1, 0], [0, 0, 0, -1], [-1, 0, 0, 0], [0, 1, 0, 0]], dtype=np.complex64)
+        ]
+        e_a_mu = self.compute_vierbein(g_mu_nu)
+        e_mu_a = np.linalg.inv(e_a_mu)
+        gamma_mu = [sum(e_mu_a[mu, a] * gamma_flat[a] for a in range(4)) for mu in range(4)]
+        return gamma_mu
+
+    def gell_mann_matrices(self):
+        return [
+            np.array([[0, 1, 0], [1, 0, 0], [0, 0, 0]], dtype=np.complex64),
+            np.array([[0, -1j, 0], [1j, 0, 0], [0, 0, 0]], dtype=np.complex64),
+            np.array([[1, 0, 0], [0, -1, 0], [0, 0, 0]], dtype=np.complex64),
+            np.array([[0, 0, 1], [0, 0, 0], [1, 0, 0]], dtype=np.complex64),
+            np.array([[0, 0, -1j], [0, 0, 0], [1j, 0, 0]], dtype=np.complex64),
+            np.array([[0, 0, 0], [0, 0, 1], [0, 1, 0]], dtype=np.complex64),
+            np.array([[0, 0, 0], [0, 0, -1j], [0, 1j, 0]], dtype=np.complex64),
+            np.array([[1, 0, 0], [0, 1, 0], [0, 0, -2]], dtype=np.complex64) / np.sqrt(3)
+        ]
+
+    def covariant_derivative(self, psi, i, mu):
+        if mu != 0:
+            psi_plus = self.quantum['spinor'][(i + 1) % self.resolution] if i + 1 < self.resolution else psi
+            psi_minus = self.quantum['spinor'][(i - 1) % self.resolution] if i - 1 >= 0 else psi
+            partial_psi = (psi_plus - psi_minus) / (2 * self.dx)
+            harmonic_scale = self.pythagorean_ratios[mu % len(self.pythagorean_ratios)]
+            partial_psi *= harmonic_scale
+        else:
+            partial_psi = 0
+        Gamma_mu = self.christoffel[i, mu]
+        connection_term = np.dot(Gamma_mu, psi)
+        return partial_psi + connection_term
+
+    def schumann_potential(self, t):
+        V_0 = 1e-6
+        V_t = 0
+        for fn, An in zip(self.schumann_freqs, self.schumann_amplitudes):
+            V_t += V_0 * An * np.cos(2 * np.pi * fn * t)
+        return V_t
+
+    def dirac_hamiltonian(self, psi, i, t, quark=False, flavor=None, color=None):
+        gamma_mu = self.dirac_gamma_matrices(self.metric[i])
+        H_psi = np.zeros(4, dtype=np.complex64)
+        mass = self.mass_q if quark else self.mass_e
+        for mu in range(1, 4):
+            D_mu_psi = self.covariant_derivative(psi, i, mu)
+            H_psi -= 1j * self.c * gamma_mu[0] @ gamma_mu[mu] @ D_mu_psi
+        H_psi += (mass * self.c**2 / self.hbar) * gamma_mu[0] @ psi
+        H_psi -= 1j * self.em['charge'] * sum(self.em['A_mu'][i, mu] * gamma_mu[mu] @ psi for mu in range(4))
+        V_schumann = self.schumann_potential(t)
+        H_psi += V_schumann * psi  # Driven time crystal term
+        if quark and flavor is not None and color is not None:
+            T_a = self.gell_mann_matrices()
+            strong_term = -1j * self.g_strong * sum(self.strong['A_mu'][i, a, mu] * T_a[a] @ psi 
+                                                    for a in range(8) for mu in range(4))
+            H_psi += strong_term
+        return H_psi
+
+    def dirac_rhs(self, psi, t, i, quark=False, flavor=None, color=None):
+        return -1j * self.dirac_hamiltonian(psi, i, t, quark, flavor, color) / self.hbar
+
+    def evolve_quantum_field_rk4(self):
+        dt = self.dt
+        for i in range(self.resolution):
+            t = self.time
+            psi = self.quantum['spinor'][i]
+            k1 = self.dirac_rhs(psi, t, i)
+            k2 = self.dirac_rhs(psi + 0.5 * dt * k1, t + 0.5 * dt, i)
+            k3 = self.dirac_rhs(psi + 0.5 * dt * k2, t + 0.5 * dt, i)
+            k4 = self.dirac_rhs(psi + dt * k3, t + dt, i)
+            self.quantum['spinor'][i] += (k1 + 2 * k2 + 2 * k3 + k4) * (dt / 6)
+
+            for flavor in range(2):
+                for color in range(3):
+                    psi_q = self.quantum['quark_spinors'][i, flavor, color]
+                    k1_q = self.dirac_rhs(psi_q, t, i, quark=True, flavor=flavor, color=color)
+                    k2_q = self.dirac_rhs(psi_q + 0.5 * dt * k1_q, t + 0.5 * dt, i, quark=True, flavor=flavor, color=color)
+                    k3_q = self.dirac_rhs(psi_q + 0.5 * dt * k2_q, t + 0.5 * dt, i, quark=True, flavor=flavor, color=color)
+                    k4_q = self.dirac_rhs(psi_q + dt * k3_q, t + dt, i, quark=True, flavor=flavor, color=color)
+                    self.quantum['quark_spinors'][i, flavor, color] += (k1_q + 2 * k2_q + 2 * k3_q + k4_q) * (dt / 6)
+        self.time += dt
+
+    def compute_em_field(self):
+        # Compute electromagnetic field with lattice properties
+        for i in range(self.resolution):
+            E = np.zeros(3, dtype=np.float32)
+            B = np.zeros(3, dtype=np.float32)
+            r_i = self.fabric[i, :3]
+            for p in self.particles:
+                r_p = p['position'][:3]
+                r_diff = r_p - r_i
+                r_norm = np.linalg.norm(r_diff)
+                if r_norm > 1e-6:
+                    E += (p['charge'] * r_diff) / (4 * np.pi * self.eps_0 * r_norm**3)
+                    v = p['velocity'][:3]
+                    B += (self.mu_0 * p['charge'] * np.cross(v, r_diff)) / (4 * np.pi * r_norm**3)
+            
+            # Lattice polarization: P = α * E
+            self.polarization[i] = self.polarizability * E
+            
+            # Lattice current density: J = σ * E
+            self.current_density[i] = self.conductivity * E
+            
+            # Update F_munu with E and B fields
+            self.em['F_munu'][i, 1:4, 0] = E
+            self.em['F_munu'][i, 0, 1:4] = -E
+            self.em['F_munu'][i, 1, 2] = B[2]
+            self.em['F_munu'][i, 2, 1] = -B[2]
+            self.em['F_munu'][i, 2, 3] = B[0]
+            self.em['F_munu'][i, 3, 2] = -B[0]
+            self.em['F_munu'][i, 3, 1] = B[1]
+            self.em['F_munu'][i, 1, 3] = -B[1]
+
+    def equations_of_motion(self, y, t):
+        x, y_coord, z, vx, vy, vz = y
+        i = self.find_closest_fabric_point(x, y_coord, z)
+        v2 = (vx**2 + vy**2 + vz**2) / self.c**2
+        gamma = 1.0 / np.sqrt(1 - v2) if v2 < 1 else 1.0
+        u = np.array([gamma, gamma*vx/self.c, gamma*vy/self.c, gamma*vz/self.c], dtype=np.float32)
+
+        # Geodesic acceleration (full GR)
+        geo_accel = np.zeros(3, dtype=np.float32)
+        for spatial_dim in range(3):
+            Γ = self.christoffel[i, spatial_dim+1, :, :]
+            geo_accel[spatial_dim] = -np.einsum('ij,i,j', Γ, u, u) * self.c**2
+
+        # Electromagnetic force with lattice effects
+        em_force = self.em['charge'] * np.einsum('ij,j', self.em['F_munu'][i, 1:4, :], u)[:3]
+        
+        # Friction term for crystal formation
+        friction_force = -self.friction * np.array([vx, vy, vz], dtype=np.float32)
+
+        coordinate_accel = (geo_accel + em_force + friction_force) / (self.mass_e * gamma**2)
+        coordinate_accel = np.clip(coordinate_accel, -1e10, 1e10)
+        return [vx, vy, vz, coordinate_accel[0], coordinate_accel[1], coordinate_accel[2]]
+
+    def find_closest_fabric_point(self, x, y, z):
+        r_point = np.sqrt(x**2 + y**2 + z**2)
+        i = np.argmin(np.abs(np.linalg.norm(self.fabric[:, :3], axis=1) - r_point))
+        return i
+
+    def total_stress_energy(self):
+        r = np.linalg.norm(self.fabric[:, :3], axis=1)
+        r = np.where(r < 1e-6, 1e-6, r)
+        phi_N = self.quantum['phi_N']
+        T = np.zeros((self.resolution, 4, 4), dtype=np.float32)
+        T[:, 0, 0] = -phi_N / self.c**2
+        T_EM = np.einsum('...ij,...kj', self.em['F_munu'], self.em['F_munu']) * (1/(4*np.pi*self.eps_0))
+        # Add polarization and current density contributions
+        for i in range(self.resolution):
+            T_EM[i, 1:4, 0] += self.polarization[i] / self.eps_0
+            T_EM[i, 0, 1:4] -= self.current_density[i] / self.c
+        T += T_EM
+        self.stress_energy = T
+        return T
+
+    def evolve_system(self, steps=100):
+        for _ in range(steps):
+            self.evolve_quantum_field_rk4()
+            self.compute_em_field()
+            self.move_charged_particles(self.dt)
+            t = self.fabric[:, 3] + self.time
+            self.gw['plus'] = 1e-6 * np.sin(2 * np.pi * 7.83 * t)
+            self.gw['cross'] = 1e-6 * np.cos(2 * np.pi * 7.83 * t)
+            self.metric = self.compute_metric()
+            self.christoffel = self.compute_christoffel_symbols_analytical()
+            self.total_stress_energy()
+
+    def move_charged_particles(self, dt):
+        for p in self.particles:
+            state = np.concatenate([p['position'][:3], p['velocity'][:3]])
+            t_range = np.linspace(0, dt, 2)
+            trajectory = odeint(self.equations_of_motion, state, t_range)
+            p['position'][:3] = trajectory[-1, :3]
+            p['velocity'][:3] = trajectory[-1, 3:]
+            p['path'].append(p['position'][:3].copy())
+
+    def add_particle(self, position, velocity, charge):
+        particle = {
+            'position': np.array(position, dtype=np.float32),
+            'velocity': np.array(velocity, dtype=np.float32),
+            'charge': charge,
+            'path': [position[:3].copy()]
+        }
+        self.particles.append(particle)
+
+    def initialize_crystal_particles(self):
+        for i in range(self.resolution):
+            ix, iy, iz = np.unravel_index(i, (self.grid_size, self.grid_size, self.grid_size))
+            charge = self.em['charge'] if (ix + iy + iz) % 2 == 0 else -self.em['charge']
+            velocity = 0.1 * self.c * np.random.randn(4).astype(np.float32)
+            self.add_particle(self.fabric[i], velocity, charge)
+
+    def visualize_unified_fields(self):
+        fig = plt.figure(figsize=(20, 16))
+        
+        ax1 = fig.add_subplot(221, projection='3d')
+        x, y, z = self.fabric[:, :3].T
+        ricci_proxy = np.diag(self.metric[:, 0, 0])
+        sc1 = ax1.scatter(x, y, z, c=ricci_proxy, cmap='viridis')
+        ax1.set_title('Spacetime Curvature (Full GR)')
+        fig.colorbar(sc1, ax=ax1)
+
+        ax2 = fig.add_subplot(222)
+        spinor_norm = np.sum(np.abs(self.quantum['spinor'])**2, axis=1)
+        ax2.plot(spinor_norm, label='Spinor Norm (Time Crystal)')
+        ax2.set_title('Quantum Field Density with Schumann Oscillations')
+        ax2.legend()
+
+        ax3 = fig.add_subplot(223, projection='3d')
+        pol_norm = np.linalg.norm(self.polarization, axis=1)
+        sc3 = ax3.scatter(x, y, z, c=pol_norm, cmap='plasma')
+        ax3.set_title('Lattice Polarization Magnitude')
+        fig.colorbar(sc3, ax=ax3)
+
+        ax4 = fig.add_subplot(224, projection='3d')
+        for (i, j), _ in self.edges[:50]:  # Limit edges for clarity
+            ax4.plot([self.fabric[i, 0], self.fabric[j, 0]], 
+                     [self.fabric[i, 1], self.fabric[j, 1]], 
+                     [self.fabric[i, 2], self.fabric[j, 2]], 'r-', alpha=0.2)
+        for p in self.particles:
+            path = np.array(p['path'])
+            ax4.plot(path[:, 0], path[:, 1], path[:, 2], c='blue', alpha=0.5)
+        ax4.set_title('Crystal Structure & Particle Paths')
+        
+        plt.tight_layout()
+        plt.show()
+
+if __name__ == "__main__":
+    sim = UnifiedSpacetimeSimulator(grid_size=5, lambda_=1.0, kappa=0.1, charge_density=1e-15)
+    sim.initialize_crystal_particles()
+    sim.evolve_system(steps=100)
+    sim.visualize_unified_fields()
