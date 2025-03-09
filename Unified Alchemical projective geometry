@@ -45,12 +45,14 @@ class UnifiedSpacetimeSimulator:
         self.thermal_diffusivity = 1e-6  # Thermal diffusivity (m²/s) for alchemical "fire"
         self.temp_field = np.ones(self.resolution) * self.alchemical_temp  # Temperature field (K)
 
+        # Moved fabric initialization before cell initialization
+        self.fabric, self.edges, self.planes = self.generate_spacetime_fabric()
+
         # Spatial partitioning for performance
         self.cell_size = 1.0
         self.cells = {}
         self._initialize_cells()
 
-        self.fabric, self.edges, self.planes = self.generate_spacetime_fabric()
         self.quantum = self.init_quantum_fields()
         self.metric = self.compute_metric()
         self.christoffel = self.compute_christoffel_symbols_analytical()
@@ -193,7 +195,7 @@ class UnifiedSpacetimeSimulator:
         e_a_mu = np.zeros((4, 4), dtype=np.float64)
         for mu in range(4):
             e_a_mu[mu, mu] = np.sqrt(np.abs(g_mu_nu[mu, mu]))
-        return e_mu_a
+        return e_a_mu  # Fixed return variable
 
     def dirac_gamma_matrices(self, g_mu_nu):
         gamma_flat = [
