@@ -1,0 +1,455 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.linalg import expm, svdvals
+
+# Physical Constants (Natural units: c = 1, hbar = 1)
+G = 6.73e-39  # GeV^-2
+c = 1.0
+hbar = 1.0
+alpha = 1 / 137.0
+e = np.sqrt(4 * np.pi * alpha)
+epsilon_0 = 1 / (4 * np.pi)
+mu_0 = 4 * np.pi * alpha
+m_e = 5.11e-4  # GeV
+g_w = 0.653
+g_s = 1.221
+v = 246.0  # GeV
+l_p = np.sqrt(G)
+kappa = 1e-12
+lambda_higgs = 0.33333333326
+NORMALIZATION_FACTOR = 0.33333333326
+RS = 2.0 * G * m_e
+
+# Simulation Configuration
+CONFIG = {
+    "swarm_size": 5,
+    "max_iterations": 1000,
+    "resolution": 16,
+    "time_delay_steps": 3,
+    "ctc_feedback_factor": 5.0,
+    "entanglement_factor": 0.2,
+    "charge": e,
+    "em_strength": 3.0,
+    "nodes": 16,
+    "dt": 1e-2,
+    "length_scale": l_p * 1e5,
+    "log_tensors": True  # Enable detailed tensor logging
+}
+
+# Pauli and Gell-Mann Matrices
+sigma = [
+    np.array([[0, 1], [1, 0]]),
+    np.array([[0, -1j], [1j, 0]]),
+    np.array([[1, 0], [0, -1]])
+]
+lambda_matrices = [
+    np.array([[0, 1, 0], [1, 0, 0], [0, 0, 0]]),
+    np.array([[0, -1j, 0], [1j, 0, 0], [0, 0, 0]]),
+    np.array([[1, 0, 0], [0, -1, 0], [0, 0, 0]]),
+    np.array([[0, 0, 1], [0, 0, 0], [1, 0, 0]]),
+    np.array([[0, 0, -1j], [0, 0, 0], [1j, 0, 0]]),
+    np.array([[0, 0, 0], [0, 0, 1], [0, 1, 0]]),
+    np.array([[0, 0, 0], [0, 0, -1j], [0, 1j, 0]]),
+    np.array([[1, 0, 0], [0, 1, 0], [0, 0, -2]]) / np.sqrt(3)
+]
+
+f_su2 = np.zeros((3, 3, 3))
+for a in range(3):
+    for b in range(3):
+        for c in range(3):
+            if (a, b, c) in [(0, 1, 2), (1, 2, 0), (2, 0, 1)]:
+                f_su2[a, b, c] = 1
+            elif (a, b, c) in [(2, 1, 0), (0, 2, 1), (1, 0, 2)]:
+                f_su2[a, b, c] = -1
+
+f_su3 = np.zeros((8, 8, 8))
+f_su3[0, 1, 2] = 1; f_su3[0, 2, 1] = -1
+f_su3[0, 3, 4] = 1/2; f_su3[0, 4, 3] = -1/2
+f_su3[0, 5, 6] = 1/2; f_su3[0, 6, 5] = -1/2
+f_su3[1, 3, 5] = 1/2; f_su3[1, 5, 3] = -1/2
+f_su3[1, 4, 6] = -1/2; f_su3[1, 6, 4] = 1/2
+f_su3[2, 3, 6] = 1/2; f_su3[2, 6, 3] = -1/2
+f_su3[2, 4, 5] = 1/2; f_su3[2, 5, 4] = -1/2
+f_su3[3, 4, 7] = np.sqrt(3)/2; f_su3[3, 7, 4] = -np.sqrt(3)/2
+f_su3[5, 6, 7] = np.sqrt(3)/2; f_su3[5, 7, 6] = -np.sqrt(3)/2
+
+# Helper Functions
+def repeating_curve(index):
+    return 1 if index % 2 == 0 else -1
+
+def compute_entanglement_entropy(fermion_field, resolution):
+    entropy_sum = 0.0
+    for i in range(resolution):
+        local_state = fermion_field[i].flatten()
+        if np.linalg.norm(local_state) > 0:
+            local_state = local_state / np.linalg.norm(local_state)
+        psi_matrix = local_state.reshape(2, 4)
+        schmidt_coeffs = svdvals(psi_matrix)
+        schmidt_coeffs = schmidt_coeffs / np.sum(schmidt_coeffs)
+        probs = schmidt_coeffs**2
+        probs = probs[probs > 1e-15]
+        entropy = -np.sum(probs * np.log(probs)) if probs.size > 0 else 0.0
+        entropy_sum += entropy
+    average_entropy = entropy_sum / resolution
+    return average_entropy
+
+def simulate_hall_sensor(iteration):
+    return 512 + 511 * np.sin(iteration * 0.05)
+
+# Spin Network Class
+class SpinNetwork:
+    def __init__(self, nodes=CONFIG["nodes"]):
+        self.nodes = nodes
+        self.edges = [(i, (i + 1) % nodes) for i in range(nodes)]
+        self.state = np.ones(nodes, dtype=complex) / np.sqrt(nodes)
+
+    def evolve(self, H, dt):
+        self.state = expm(-1j * H * dt) @ self.state
+
+    def get_adjacency_matrix(self):
+        A = np.zeros((self.nodes, self.nodes))
+        for i, j in self.edges:
+            A[i, j] = A[j, i] = 1
+        return A
+
+# CTC Tetrahedral Field Class
+class CTCTetrahedralField:
+    def __init__(self, resolution=CONFIG["resolution"], length_scale=CONFIG["length_scale"]):
+        self.resolution = resolution
+        self.length_scale = length_scale
+        self.coordinates = self._generate_tetrahedral_coordinates()
+        self.H = self._build_hamiltonian()
+
+    def _generate_tetrahedral_coordinates(self):
+        coords = np.zeros((self.resolution, 4))
+        t = np.linspace(0, CONFIG["dt"] * self.resolution, self.resolution)
+        coords[:, 0] = self.length_scale * np.cos(t / CONFIG["dt"]) * np.sin(t / CONFIG["dt"])
+        coords[:, 1] = self.length_scale * np.sin(t / CONFIG["dt"]) * np.sin(t / CONFIG["dt"])
+        coords[:, 2] = self.length_scale * np.cos(t / CONFIG["dt"])
+        coords[:, 3] = t
+        return coords
+
+    def _build_hamiltonian(self):
+        H = np.zeros((self.resolution, self.resolution), dtype=complex)
+        for i in range(self.resolution):
+            for j in range(self.resolution):
+                if i != j:
+                    delta_x = np.linalg.norm(self.coordinates[i, :3] - self.coordinates[j, :3])
+                    H[i, j] = 1e-10 * (i + j) / (delta_x + 1e-10)
+                else:
+                    H[i, i] = -1j * np.linalg.norm(self.coordinates[i, :3])
+        return H
+
+    def propagate(self, ψ0, τ):
+        return expm(-1j * self.H * τ) @ ψ0
+
+# Wormhole Nodes Generation
+def generate_wormhole_nodes(resolution=CONFIG["resolution"], length_scale=CONFIG["length_scale"]):
+    nodes = np.zeros((resolution, 4))
+    τ = np.linspace(0, CONFIG["dt"] * resolution, resolution)
+    R, r = 1.5 * length_scale, 0.5 * length_scale
+    ω = 3 / CONFIG["dt"]
+    nodes[:, 0] = (R + r * np.cos(ω * τ)) * np.cos(τ / CONFIG["dt"])
+    nodes[:, 1] = (R + r * np.cos(ω * τ)) * np.sin(τ / CONFIG["dt"])
+    nodes[:, 2] = r * np.sin(ω * τ)
+    nodes[:, 3] = τ
+    return nodes
+
+# Comprehensive TVLE Simulation Class
+class ComprehensiveTVLESimulation:
+    def __init__(self):
+        self.resolution = CONFIG["resolution"]
+        self.length_scale = CONFIG["length_scale"]
+        self.dt = CONFIG["dt"]
+        self.spin_network = SpinNetwork()
+        self.tetrahedral_field = CTCTetrahedralField()
+        self.wormhole_nodes = generate_wormhole_nodes()
+        self.bit_states = np.array([repeating_curve(i) for i in range(self.resolution)], dtype=int)
+        self.temporal_entanglement = np.zeros(self.resolution)
+        self.quantum_state = np.ones(self.resolution, dtype=complex) / np.sqrt(self.resolution)
+        self.history = []
+        self.fermion_history = []
+        self.harmonic_amplitudes = np.zeros((self.resolution, 4), dtype=complex)
+        self.entanglement_history = []
+
+        print("Initializing metric tensor...")
+        self.metric = self.compute_metric_tensor()
+        if CONFIG["log_tensors"]:
+            for i in range(self.resolution):
+                print(f"Initial Quantum Metric Tensor for node {i}:", self.metric[i])
+                np.savetxt(f"metric_initial_node_{i}.txt", self.metric[i], fmt='%.6e', header=f"Initial Quantum Metric Tensor Node {i}")
+
+        self.metric_inv = np.linalg.inv(self.metric)
+        self.connection = self.compute_christoffel_symbols()
+        
+        self.riemann_tensor = self.compute_riemann_tensor()
+        if CONFIG["log_tensors"]:
+            for i in range(self.resolution):
+                print(f"Initial Riemann Tensor (flattened) for node {i}:", self.riemann_tensor[i].flatten())
+                np.savetxt(f"riemann_initial_node_{i}.txt", self.riemann_tensor[i].flatten(), fmt='%.6e', header=f"Initial Riemann Tensor Node {i}")
+
+        self.ricci_tensor, self.ricci_scalar = self.compute_curvature()
+        if CONFIG["log_tensors"]:
+            for i in range(self.resolution):
+                print(f"Initial Ricci Tensor for node {i}:", self.ricci_tensor[i])
+                np.savetxt(f"ricci_initial_node_{i}.txt", self.ricci_tensor[i], fmt='%.6e', header=f"Initial Ricci Tensor Node {i}")
+
+        self.em_field = self.initialize_em_field()
+        print("Initializing weak field...")
+        self.weak_field = self.initialize_weak_field()
+        print("Initializing strong field...")
+        self.strong_field = self.initialize_strong_field()
+        self.higgs_field = np.ones((self.resolution, 2), dtype=complex) * v
+        self.fermion_field = np.zeros((self.resolution, 4, 2), dtype=complex)
+        self.fermion_field[:, 0, 0] = 1e-10
+        print("Computing stress-energy tensor...")
+        self.stress_energy = self.compute_stress_energy()
+
+        self.einstein_tensor = self.compute_einstein_tensor()
+        if CONFIG["log_tensors"]:
+            for i in range(self.resolution):
+                print(f"Initial Einstein Tensor for node {i}:", self.einstein_tensor[i])
+                np.savetxt(f"einstein_initial_node_{i}.txt", self.einstein_tensor[i], fmt='%.6e', header=f"Initial Einstein Tensor Node {i}")
+
+        x, y, z, t = self.wormhole_nodes[0]
+        r = np.sqrt(x**2 + y**2 + z**2) + 1e-10
+        schwarzschild_factor = 1 - RS / r
+        metric_sample = np.array([
+            [schwarzschild_factor, 1e-6, 0, 0],
+            [1e-6, 1 + y**2, 1e-6, 0],
+            [0, 1e-6, 1 + z**2, 1e-6],
+            [0, 0, 1e-6, -schwarzschild_factor]
+        ], dtype=complex)
+        U, _, Vh = np.linalg.svd(metric_sample)
+        self.unitary_matrix = U
+        print(f"Unitary matrix shape: {self.unitary_matrix.shape}")
+
+        print("Initialization complete.")
+
+    def compute_metric_tensor(self):
+        metric = np.zeros((self.resolution, 4, 4))
+        for i in range(self.resolution):
+            x, y, z, t = self.wormhole_nodes[i]
+            r = np.sqrt(x**2 + y**2 + z**2) + 1e-10
+            schwarzschild_factor = 1 - RS / r
+            metric[i] = np.array([
+                [schwarzschild_factor, 1e-6, 0, 0],
+                [1e-6, 1 + y**2, 1e-6, 0],
+                [0, 1e-6, 1 + z**2, 1e-6],
+                [0, 0, 1e-6, -schwarzschild_factor]
+            ])
+        return metric
+
+    def compute_christoffel_symbols(self):
+        connection = np.zeros((self.resolution, 4, 4, 4))
+        dx = self.wormhole_nodes[:, 3]
+        for i in range(self.resolution):
+            for rho in range(4):
+                for mu in range(4):
+                    for nu in range(4):
+                        grad_terms = np.zeros(4)
+                        for sigma in range(4):
+                            grad_mu_rho = np.gradient(self.metric[:, mu, sigma], dx, axis=0)[i]
+                            grad_nu_rho = np.gradient(self.metric[:, nu, sigma], dx, axis=0)[i]
+                            grad_mu_nu = np.gradient(self.metric[:, sigma, nu], dx, axis=0)[i]
+                            grad_terms[sigma] = grad_mu_rho + grad_nu_rho - grad_mu_nu
+                        connection[i, rho, mu, nu] = 0.5 * np.einsum('rs,s->r', self.metric_inv[i], grad_terms)[rho] / self.length_scale
+        return connection
+
+    def compute_riemann_tensor(self):
+        riemann = np.zeros((self.resolution, 4, 4, 4, 4), dtype=complex)
+        dx = self.wormhole_nodes[:, 3]
+        for i in range(self.resolution):
+            for rho in range(4):
+                for sigma in range(4):
+                    for mu in range(4):
+                        for nu in range(4):
+                            grad_nu_sigma = np.gradient(self.connection[:, rho, nu, sigma], dx, axis=0)[i]
+                            grad_mu_sigma = np.gradient(self.connection[:, rho, mu, sigma], dx, axis=0)[i]
+                            term1 = np.einsum('m,m->', self.connection[i, rho, :, mu], self.connection[i, :, nu, sigma])
+                            term2 = np.einsum('m,m->', self.connection[i, rho, :, nu], self.connection[i, :, mu, sigma])
+                            riemann[i, rho, sigma, mu, nu] = (grad_nu_sigma - grad_mu_sigma + term1 - term2) / self.length_scale**2
+        return riemann
+
+    def compute_curvature(self):
+        ricci_tensor = np.zeros((self.resolution, 4, 4), dtype=complex)
+        for i in range(self.resolution):
+            ricci_tensor[i] = np.einsum('rsrs->rs', self.riemann_tensor[i])
+        ricci_scalar = np.einsum('imn,imn->i', self.metric_inv, ricci_tensor)
+        return ricci_tensor, ricci_scalar
+
+    def compute_einstein_tensor(self):
+        einstein_tensor = np.zeros((self.resolution, 4, 4), dtype=complex)
+        for i in range(self.resolution):
+            einstein_tensor[i] = self.ricci_tensor[i] - 0.5 * self.metric[i] * self.ricci_scalar[i] * np.eye(4)
+        return einstein_tensor
+
+    def initialize_em_field(self):
+        A = np.zeros((self.resolution, 4), dtype=complex)
+        r = np.linalg.norm(self.wormhole_nodes[:, :3], axis=1) + 1e-10
+        A[:, 0] = CONFIG["charge"] / (4 * np.pi * epsilon_0 * r)
+        F = np.zeros((self.resolution, 4, 4), dtype=complex)
+        dx = self.wormhole_nodes[:, 3]
+        for i in range(self.resolution):
+            for mu in range(4):
+                for nu in range(4):
+                    partial_term = (np.gradient(A[:, nu], dx, axis=0)[i] - np.gradient(A[:, mu], dx, axis=0)[i]) / self.length_scale
+                    connection_term = np.einsum('l,l->', self.connection[i, :, mu, nu], A[i])
+                    F[i, mu, nu] = partial_term + connection_term
+        F_norm = np.linalg.norm(F, axis=(1, 2), keepdims=True)
+        F = np.where(F_norm > 0, F / (F_norm + 1e-10), F)
+        J = np.zeros((self.resolution, 4))
+        J[:, 0] = CONFIG["charge"] / (4 * np.pi * r**3)
+        return {"A": A, "F": F, "J": J}
+
+    def initialize_weak_field(self):
+        W = np.zeros((self.resolution, 4, 3), dtype=complex)
+        for i in range(self.resolution):
+            for mu in range(4):
+                W[i, mu, :] = np.random.rand(3) / self.length_scale
+        F_W = np.zeros((self.resolution, 4, 4, 3), dtype=complex)
+        dx = self.wormhole_nodes[:, 3]
+        for i in range(self.resolution):
+            for mu in range(4):
+                for nu in range(4):
+                    for a in range(3):
+                        grad_term = (np.gradient(W[:, nu, a], dx, axis=0)[i] - np.gradient(W[:, mu, a], dx, axis=0)[i]) / self.length_scale
+                        gauge_term = g_w * np.einsum('abc,b,c->a', f_su2, W[i, mu, :], W[i, nu, :])[a]
+                        F_W[i, mu, nu, a] = grad_term + gauge_term
+        F_W_norm = np.sqrt(np.sum(np.abs(F_W)**2, axis=(1, 2, 3), keepdims=True))
+        F_W = np.where(F_W_norm > 0, F_W / (F_W_norm + 1e-10), F_W)
+        return {"W": W, "F": F_W}
+
+    def initialize_strong_field(self):
+        G = np.zeros((self.resolution, 4, 8), dtype=complex)
+        for i in range(self.resolution):
+            for mu in range(4):
+                G[i, mu, :] = np.random.rand(8) / self.length_scale
+        F_G = np.zeros((self.resolution, 4, 4, 8), dtype=complex)
+        dx = self.wormhole_nodes[:, 3]
+        for i in range(self.resolution):
+            for mu in range(4):
+                for nu in range(4):
+                    for a in range(8):
+                        grad_term = (np.gradient(G[:, nu, a], dx, axis=0)[i] - np.gradient(G[:, mu, a], dx, axis=0)[i]) / self.length_scale
+                        gauge_term = g_s * np.einsum('abc,b,c->a', f_su3, G[i, mu, :], G[i, nu, :])[a]
+                        F_G[i, mu, nu, a] = grad_term + gauge_term
+        F_G_norm = np.sqrt(np.sum(np.abs(F_G)**2, axis=(1, 2, 3), keepdims=True))
+        F_G = np.where(F_G_norm > 0, F_G / (F_G_norm + 1e-10), F_G)
+        return {"G": G, "F": F_G}
+
+    def compute_stress_energy(self):
+        T = np.zeros((self.resolution, 4, 4), dtype=complex)
+        for i in range(self.resolution):
+            F = self.em_field["F"][i]
+            T[i] = np.einsum('ma,nb,ab->mn', F, F, self.metric[i]) / (4 * np.pi * epsilon_0) - \
+                   0.25 * self.metric[i] * np.einsum('ab,ab->', F, F) / (4 * np.pi * epsilon_0)
+        return T
+
+    def compute_vector_potential(self, iteration):
+        A = np.zeros((self.resolution, 4), dtype=complex)
+        r = np.linalg.norm(self.wormhole_nodes[:, :3], axis=1) + 1e-10
+        load_factor = iteration * 0.01
+        A[:, 0] = CONFIG["charge"] / (4 * np.pi * epsilon_0 * r) * (1 + np.sin(iteration * 0.2) * load_factor)
+        A[:, 3] = CONFIG["charge"] / (4 * np.pi * epsilon_0 * r) * (1 + load_factor)
+        return A
+
+    def get_hall_sensor_reading(self, iteration, electromagnet_on):
+        return simulate_hall_sensor(iteration) if electromagnet_on else 512
+
+    def quantum_walk(self, iteration, electromagnet_on=True):
+        A_mu = self.compute_vector_potential(iteration)
+        prob = np.abs(self.quantum_state)**2
+        
+        adj_matrix = self.spin_network.get_adjacency_matrix() / self.length_scale
+        self.spin_network.evolve(adj_matrix, self.dt)
+
+        if len(self.fermion_history) >= CONFIG["time_delay_steps"]:
+            past_field = self.fermion_history[-CONFIG["time_delay_steps"]]
+            temporal_feedback = CONFIG["ctc_feedback_factor"] * (past_field - self.fermion_field) * self.dt
+            self.fermion_field += temporal_feedback
+
+        hall_value = self.get_hall_sensor_reading(iteration, electromagnet_on)
+        magnetic_field = hall_value / 1023.0
+
+        for idx in range(self.resolution):
+            window = prob[max(0, idx - CONFIG["time_delay_steps"]):idx + 1]
+            self.temporal_entanglement[idx] = CONFIG["entanglement_factor"] * np.mean(window) if window.size > 0 else 0
+            J4_effects = np.einsum('m,m->', self.em_field["J"][idx], self.em_field["J"][idx])**2 * (1 + magnetic_field)
+            em_perturbation = A_mu[idx, 0] * CONFIG["em_strength"] * self.length_scale
+            flip_prob = self.temporal_entanglement[idx] * (em_perturbation + J4_effects)
+            if np.random.random() < abs(flip_prob):
+                self.bit_states[idx] = -self.bit_states[idx]
+            self.harmonic_amplitudes[idx] += kappa * J4_effects * A_mu[idx]
+
+        self.quantum_state = self.tetrahedral_field.propagate(self.quantum_state, self.dt)
+        self.em_field["A"] += self.dt * self.em_field["J"]
+        self.stress_energy = self.compute_stress_energy()
+        self.connection = self.compute_christoffel_symbols()
+        self.riemann_tensor = self.compute_riemann_tensor()
+        self.ricci_tensor, self.ricci_scalar = self.compute_curvature()
+        self.einstein_tensor = self.compute_einstein_tensor()
+
+        fermion_entanglement = compute_entanglement_entropy(self.fermion_field, self.resolution)
+        self.entanglement_history.append(fermion_entanglement)
+        self.history.append(self.bit_states.copy())
+        self.fermion_history.append(self.fermion_field.copy())
+
+        if CONFIG["log_tensors"] and iteration % 100 == 0:
+            print(f"Iteration {iteration}:")
+            for i in range(self.resolution):
+                print(f"Quantum Metric Tensor for node {i}:", self.metric[i])
+                np.savetxt(f"metric_iter_{iteration}_node_{i}.txt", self.metric[i], fmt='%.6e', header=f"Quantum Metric Tensor Node {i} Iteration {iteration}")
+                print(f"Riemann Tensor (flattened) for node {i}:", self.riemann_tensor[i].flatten())
+                np.savetxt(f"riemann_iter_{iteration}_node_{i}.txt", self.riemann_tensor[i].flatten(), fmt='%.6e', header=f"Riemann Tensor Node {i} Iteration {iteration}")
+                print(f"Ricci Tensor for node {i}:", self.ricci_tensor[i])
+                np.savetxt(f"ricci_iter_{iteration}_node_{i}.txt", self.ricci_tensor[i], fmt='%.6e', header=f"Ricci Tensor Node {i} Iteration {iteration}")
+                print(f"Einstein Tensor for node {i}:", self.einstein_tensor[i])
+                np.savetxt(f"einstein_iter_{iteration}_node_{i}.txt", self.einstein_tensor[i], fmt='%.6e', header=f"Einstein Tensor Node {i} Iteration {iteration}")
+
+    def run(self, electromagnet_on=True):
+        print(f"Running simulation (Electromagnet {'On' if electromagnet_on else 'Off'})...")
+        bit_flip_rates = []
+        previous_bit_states = None
+        for i in range(CONFIG["max_iterations"]):
+            previous_bit_states = self.bit_states.copy()
+            self.quantum_walk(i, electromagnet_on)
+            bit_flips = np.sum(self.bit_states != previous_bit_states) / self.resolution
+            bit_flip_rates.append(bit_flips)
+            if i % 100 == 0:
+                print(f"Iteration {i}: Entropy = {self.entanglement_history[-1]:.4f}, Bit Flip Rate = {bit_flips:.4f}")
+        return bit_flip_rates, self.entanglement_history
+
+# Main Function
+def main():
+    print("Starting TVLE simulation...")
+    sim = ComprehensiveTVLESimulation()
+    bit_flips_on, entropy_on = sim.run(electromagnet_on=True)
+    print(f"Electromagnet On - Avg Bit Flip Rate: {np.mean(bit_flips_on):.4f}, Avg Entropy: {np.mean(entropy_on):.4f}")
+
+    sim = ComprehensiveTVLESimulation()
+    bit_flips_off, entropy_off = sim.run(electromagnet_on=False)
+    print(f"Electromagnet Off - Avg Bit Flip Rate: {np.mean(bit_flips_off):.4f}, Avg Entropy: {np.mean(entropy_off):.4f}")
+
+    iterations = range(CONFIG["max_iterations"])
+    plt.figure(figsize=(8, 6))
+    plt.subplot(2, 1, 1)
+    plt.plot(iterations, entropy_on, label='Electromagnet On')
+    plt.plot(iterations, entropy_off, label='Electromagnet Off')
+    plt.ylabel('Entanglement Entropy')
+    plt.legend()
+    plt.grid()
+
+    plt.subplot(2, 1, 2)
+    plt.plot(iterations, bit_flips_on, label='Electromagnet On')
+    plt.plot(iterations, bit_flips_off, label='Electromagnet Off')
+    plt.xlabel('Iteration')
+    plt.ylabel('Bit Flip Rate')
+    plt.legend()
+    plt.grid()
+
+    plt.tight_layout()
+    plt.show()
+
+if __name__ == "__main__":
+    main()
